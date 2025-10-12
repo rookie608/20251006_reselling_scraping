@@ -6,18 +6,21 @@
    → 商品ページHTMLを保存
    → HTMLを解析して output/result.csv へ出力
    → 中間の url_map.csv も商品情報付で上書き保存
+   → （追加）result.csv を読み込み、OpenAIで検索キーワード列 search_keyword を生成して
+      output/result_with_まとめ.csv を出力
 
 出力：
 - output/secondstreet_results.csv : 検索ページ→商品URLの抽出結果（順位つき）
 - output/url_map.csv              : 商品URL↔HTMLファイル対応（最終的に情報付与で上書き）
-- output/result.csv               : url_map と同一構造の最終結果CSV
+- output/result.csv               : url_map と同一構造の最終結果CSV（※ model 列は除外）
+- output/result_with_まとめ.csv : result.csv + search_keyword 列
 - output/html/*.html              : 保存した商品ページ（必要に応じて検索ページも）
 
 実行例：
-  pip install playwright beautifulsoup4 lxml pandas
+  pip install playwright beautifulsoup4 lxml pandas python-dotenv openai
   playwright install
   python scrape_secondstreet_pipeline.py --headless
-  # OpenAI抽出を使う場合は OPENAI_API_KEY をセット（未設定なら自動でBSフォールバック）
+  # OpenAI抽出/キーワード生成を使う場合は OPENAI_API_KEY を設定
 """
 
 import os, re, csv, json, time, argparse, hashlib, urllib.parse, sys
@@ -29,6 +32,12 @@ import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from bs4 import BeautifulSoup, Comment
 
+# =========（キーワード生成用 追加）=========
+try:
+    from dotenv import load_dotenv  # optional
+except Exception:
+    load_dotenv = None  # type: ignore
+
 # ========== パス ==========
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
@@ -38,6 +47,7 @@ HTML_DIR  = OUT_DIR / "html"
 RESULT_SEARCH_CSV = OUT_DIR / "secondstreet_results.csv"  # 検索→商品URLの記録
 OUT_MAP           = OUT_DIR / "url_map.csv"               # 商品URL↔HTML, 最終的に情報付与で上書き
 OUT_CSV           = OUT_DIR / "result.csv"                # 同内容を別名出力
+OUT_CSV_KW        = OUT_DIR / "result_with_まとめ.csv"  # （追加）検索ワード付き最終CSV
 
 # ========== 設定 ==========
 UA = (
@@ -51,7 +61,7 @@ DETAIL_URL_RE = re.compile(r"/goods/detail/goodsId/\d+/shopsId/\d+", re.IGNORECA
 SEARCH_RESULT_LINK_SEL = "a[href*='/goods/detail/goodsId/'][href*='/shopsId/']"
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
-# ========== OpenAI（任意） ==========
+# ========== OpenAI（任意・解析フェーズ用） ==========
 _USE_LLM = True
 try:
     from openai import OpenAI
@@ -60,11 +70,11 @@ try:
     if not _OPENAI_KEY:
         _USE_LLM = False
         OpenAI = None  # type: ignore
+        APIError = RateLimitError = BadRequestError = Exception  # type: ignore
     else:
         client = OpenAI(api_key=_OPENAI_KEY)
 except Exception:
     _USE_LLM = False
-    APIError = RateLimitError = BadRequestError = Exception  # type: ignore
 
 # ========== 共通ユーティリティ ==========
 def ensure_dirs() -> None:
@@ -317,7 +327,7 @@ def extract_brand(raw_html: str, soup: BeautifulSoup) -> str:
 
     return ""
 
-# ========== LLM抽出 ==========
+# ========== LLM抽出（解析） ==========
 SYSTEM_PROMPT = "You are an information extraction engine. Return ONLY valid JSON with the required keys. No explanations."
 
 def llm_extract(snippet: str) -> Dict[str, Any]:
@@ -392,7 +402,7 @@ def bs_fallback(raw_html: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # model（RB2180などの簡易検出例）
+    # model（RB2180など）
     model = ""
     mm = re.search(r"\bRB\d+[A-Z]?\b", raw_html, flags=re.IGNORECASE)
     if mm: model = mm.group(0)
@@ -491,7 +501,7 @@ def overwrite_url_map_with_enriched(rows: List[Dict[str, str]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-# ========== メイン処理 ==========
+# ========== ここからメイン処理 ==========
 def main():
     ap = argparse.ArgumentParser(description="2nd STREET: 検索URL→商品URL抽出→HTML保存→解析（shopsId付き）")
     ap.add_argument("--headless", action="store_true", help="ブラウザをヘッドレスで実行")
@@ -530,7 +540,7 @@ def main():
     if not search_urls:
         print("[ERROR] 検索ページURLが見つかりませんでした（www.2ndstreet.jp/search が0件）。"); sys.exit(1)
 
-    # 2) Playwrightで検索ページを開いて「shopsId を含む」商品詳細URLを抽出
+    # 2) 検索ページ→商品URL抽出
     product_urls: List[str] = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -656,8 +666,6 @@ def main():
     if not map_rows:
         print(f"[WARN] 中間CSVが空です: {OUT_MAP}")
 
-    use_llm = (not args.no_llm) and _USE_LLM  # ← 念のためここでも確定
-
     for i, row in enumerate(map_rows, 1):
         url = row.get("url", "")
         fname = row.get("file", "")
@@ -689,8 +697,8 @@ def main():
                 "model": data.get("model", ""),
                 "categories": " > ".join(data.get("categories", [])),
                 "condition": data.get("condition", ""),
-                "price": data.get("price", ""),               # ← 数字のみ（例：6490）
-                "shipping_fee": data.get("shipping_fee", ""), # ← 数字のみ（例：770 / 0）
+                "price": data.get("price", ""),               # 数字のみ（例：6490）
+                "shipping_fee": data.get("shipping_fee", ""), # 数字のみ（例：770 / 0）
             })
             enriched_rows.append(base)
             print(f"[OK] {i}/{total} {fname}")
@@ -702,12 +710,12 @@ def main():
 
     overwrite_url_map_with_enriched(enriched_rows)
 
-    # === ここだけ変更：result.csv は model を除外 + 余分キー無視 ===
+    # result.csv は model を除外 + 余分キー無視
     with OUT_CSV.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(
             fp,
             fieldnames=RESULT_HEADERS,
-            extrasaction="ignore"  # ← 'model' など fieldnames 外キーは無視
+            extrasaction="ignore"
         )
         writer.writeheader()
         writer.writerows(enriched_rows)
@@ -716,6 +724,126 @@ def main():
     print(f"[WRITE] {OUT_CSV.resolve()}")
     print(f"[WRITE] {OUT_MAP.resolve()}（商品情報 付与済）")
     print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（検索→商品URL 抽出ログ）")
+
+    # 5) （追加）検索キーワード生成 → result_with_まとめ.csv
+    try:
+        append_search_keywords()
+    except Exception as e:
+        print(f"[WARN] 検索キーワード生成に失敗しました: {e}")
+        # 最低限、検索キーワード列を空で書き出す
+        try:
+            df_tmp = pd.read_csv(OUT_CSV)
+            if "search_keyword" not in df_tmp.columns:
+                df_tmp["search_keyword"] = ""
+            df_tmp.to_csv(OUT_CSV_KW, index=False, encoding="utf-8-sig")
+            print(f"[INFO] フォールバック出力: {OUT_CSV_KW.resolve()}")
+        except Exception as e2:
+            print(f"[ERROR] フォールバック出力も失敗: {e2}")
+
+# ======== （追加）検索キーワード生成ロジック ========
+KW_MODEL = "gpt-4.1-mini"
+KW_MAX_RETRIES = 5
+KW_RETRY_BASE_WAIT = 2.0  # 秒
+
+KW_SYSTEM_PROMPT = """あなたは中古EC（メルカリ・ラクマ）向けの検索キーワード生成アシスタントです。
+出力は「ブランド名＋型式（型番）」を主軸に、日本語の揺れや英語表記の揺れに強い、短くシンプルな検索語を1行で返してください。
+
+【出力ルール】
+- 1行のみ。余計な説明や引用符は不要。
+- 基本形は「{brand} {model}」。
+- 型式（例: RB2140, RB2140-A, S12F, 10A0, S1、CD Diamond S1 など）を最優先で抽出。
+- 型式が不明な場合は、ブランド名のみ（例: "Ray-Ban"）。
+- カラーや性別は原則不要。ただし型式判別が困難でヒットが弱そうな場合のみ「サングラス」など1語を補助的に付けてもよい。
+- ブランド名は公式英字表記優先。
+- 出力は1行、テキストのみ。
+"""
+
+def _kw_build_user_prompt(brand: str, product_name: str) -> str:
+    return f"""brand: {brand}
+product_name: {product_name}
+
+上記に対して、出力ルールに従い検索キーワードを1行で出力してください。"""
+
+def _get_kw_client() -> Optional["OpenAI"]:
+    # 既存 client があれば流用、なければ .env を読んで作成
+    if 'client' in globals() and isinstance(globals()['client'], object):
+        return globals().get('client')  # type: ignore
+    if load_dotenv:
+        try:
+            load_dotenv()
+        except Exception:
+            pass
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return None
+    try:
+        return OpenAI(api_key=key)
+    except Exception:
+        return None
+
+def _generate_keyword(client_obj: "OpenAI", brand: str, product_name: str) -> str:
+    brand = (brand or "").strip()
+    product_name = (product_name or "").strip()
+    if not brand and not product_name:
+        return ""
+
+    prompt = _kw_build_user_prompt(brand, product_name)
+
+    for attempt in range(1, KW_MAX_RETRIES + 1):
+        try:
+            resp = client_obj.chat.completions.create(
+                model=KW_MODEL,
+                messages=[
+                    {"role": "system", "content": KW_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=40,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            return " ".join(text.split())
+        except Exception as e:
+            wait = KW_RETRY_BASE_WAIT * (2 ** (attempt - 1))
+            print(f"[WARN] OpenAI API エラー {e} → {wait:.1f}s 待機 ({attempt}/{KW_MAX_RETRIES})")
+            time.sleep(wait)
+
+    # 連続失敗時フォールバック：ブランド単独
+    return brand
+
+def append_search_keywords() -> None:
+    """
+    output/result.csv を読み込み、brand/product_name を用いて
+    search_keyword を生成し、output/result_with_まとめ.csv に保存。
+    """
+    if not OUT_CSV.exists():
+        raise FileNotFoundError(f"{OUT_CSV} が見つかりません。前段の解析が成功しているか確認してください。")
+
+    print(f"[INFO] キーワード生成: 読み込み {OUT_CSV}")
+    df = pd.read_csv(OUT_CSV, dtype=str, keep_default_na=False)
+
+    # 列の存在保証
+    if "brand" not in df.columns:
+        df["brand"] = ""
+    if "product_name" not in df.columns:
+        df["product_name"] = ""
+
+    cli = _get_kw_client()
+    if cli is None:
+        print("[WARN] OPENAI_API_KEY 未設定または初期化失敗。brand をそのまま search_keyword に使用します。")
+        df["search_keyword"] = df["brand"].fillna("").astype(str)
+        df.to_csv(OUT_CSV_KW, index=False, encoding="utf-8-sig")
+        print(f"[✅ 完了]（フォールバック）{OUT_CSV_KW.resolve()}")
+        return
+
+    keywords: List[str] = []
+    for idx, row in df.iterrows():
+        kw = _generate_keyword(cli, str(row.get("brand","")), str(row.get("product_name","")))
+        keywords.append(kw)
+        print(f"[KW {idx+1}/{len(df)}] {kw}")
+
+    df["search_keyword"] = keywords
+    df.to_csv(OUT_CSV_KW, index=False, encoding="utf-8-sig")
+    print(f"[✅ 完了] キーワード付き出力: {OUT_CSV_KW.resolve()}")
 
 if __name__ == "__main__":
     main()
