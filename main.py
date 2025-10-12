@@ -1,39 +1,57 @@
-# scrape_secondstreet_stealth.py
+# scrape_secondstreet_pipeline.py
 # -*- coding: utf-8 -*-
 """
-一気通貫版：
-1) input/*.csv のURLから商品ページを取得し、output/html/*.html に保存
-2) 保存済みHTMLを解析して、output/result.csv を出力
-   - 画像は最初の1枚（できれば大サイズ .jpg）に限定
-   - OpenAI(JSONモード)抽出 → 失敗時はBeautifulSoupフォールバック
-使い方(最速):
-  pip install playwright beautifulsoup4 lxml openai
+2nd STREET 一気通貫パイプライン：
+  input/*.csv にある「検索ページURL」を開いて商品詳細URL(shopsId含む)を抽出
+   → 商品ページHTMLを保存
+   → HTMLを解析して output/result.csv へ出力
+   → 中間の url_map.csv も商品情報付で上書き保存
+
+出力：
+- output/secondstreet_results.csv : 検索ページ→商品URLの抽出結果（順位つき）
+- output/url_map.csv              : 商品URL↔HTMLファイル対応（最終的に情報付与で上書き）
+- output/result.csv               : url_map と同一構造の最終結果CSV
+- output/html/*.html              : 保存した商品ページ（必要に応じて検索ページも）
+
+実行例：
+  pip install playwright beautifulsoup4 lxml pandas
   playwright install
-  python scrape_secondstreet_stealth.py --headless
-オプション:
-  --phase both|html|parse        実行フェーズを選択（既定 both）
-  --overwrite                    既存HTMLを上書き保存
-  --delay 1.0                    各リクエスト間の待機秒（保存時）
-  --retries 2                    保存失敗時のリトライ回数
-  --no-llm                       LLM抽出を使わず常にBSフォールバック
+  python scrape_secondstreet_pipeline.py --headless
+  # OpenAI抽出を使う場合は OPENAI_API_KEY をセット（未設定なら自動でBSフォールバック）
 """
 
 import os, re, csv, json, time, argparse, hashlib, urllib.parse, sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterable
+from datetime import datetime
+
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from bs4 import BeautifulSoup, Comment
 
 # ========== パス ==========
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
 OUT_DIR   = BASE_DIR / "output"
 HTML_DIR  = OUT_DIR / "html"
-OUT_CSV   = OUT_DIR / "result.csv"
 
-# ========== 依存 ==========
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup, Comment
+RESULT_SEARCH_CSV = OUT_DIR / "secondstreet_results.csv"  # 検索→商品URLの記録
+OUT_MAP           = OUT_DIR / "url_map.csv"               # 商品URL↔HTML, 最終的に情報付与で上書き
+OUT_CSV           = OUT_DIR / "result.csv"                # 同内容を別名出力
 
-# OpenAIは任意（未設定なら自動フォールバック）
+# ========== 設定 ==========
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+SEARCH_PAGE_HINT = "www.2ndstreet.jp/search"
+DETAIL_URL_RE = re.compile(r"/goods/detail/goodsId/\d+/shopsId/\d+", re.IGNORECASE)
+SEARCH_RESULT_LINK_SEL = "a[href*='/goods/detail/goodsId/'][href*='/shopsId/']"
+URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+# ========== OpenAI（任意） ==========
 _USE_LLM = True
 try:
     from openai import OpenAI
@@ -48,54 +66,63 @@ try:
 except Exception:
     _USE_LLM = False
 
-# ========== URL列名候補 ==========
-URL_HEADERS = {"url","URL","Url","link","Link","LINK","商品URL","リンク","商品リンク"}
-
 # ========== 共通ユーティリティ ==========
-def read_all_csv_urls(input_dir: Path) -> List[str]:
-    urls = []
-    for p in input_dir.glob("*.csv"):
-        with open(p, "r", encoding="utf-8-sig", newline="") as f:
-            rows = list(csv.reader(f))
-        if not rows:
-            continue
-        header = [c.strip() for c in rows[0]]
-        url_col = None
-        for i, h in enumerate(header):
-            if h in URL_HEADERS or h.lower() in {x.lower() for x in URL_HEADERS}:
-                url_col = i; break
-        start = 1 if url_col is not None else 0
-        if url_col is None:
-            if rows and rows[0] and re.match(r"^https?://", (rows[0][0] or "").strip()):
-                url_col = 0
-            else:
-                for j, c in enumerate(rows[1] if len(rows)>1 else []):
-                    if re.match(r"^https?://", (c or "").strip()):
-                        url_col = j; break
-                if url_col is None:
-                    url_col = 0
-        for r in rows[start:]:
-            if not r or url_col >= len(r):
-                continue
-            u = (r[url_col] or "").strip()
-            if u.startswith("http"):
-                urls.append(u)
-    # 重複除去
-    seen, uniq = set(), []
-    for u in urls:
-        if u not in seen:
-            seen.add(u); uniq.append(u)
-    return uniq
+def ensure_dirs() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    HTML_DIR.mkdir(parents=True, exist_ok=True)
 
-def build_html_filename(url: str) -> str:
+def find_urls_in_row(cells: Iterable[Any]) -> List[str]:
+    urls: List[str] = []
+    for cell in cells:
+        if pd.isna(cell):
+            continue
+        urls += URL_RE.findall(str(cell))
+    return urls
+
+def normalize_url(base: str, href: str) -> str:
+    return href if href.startswith("http") else base.split("/search")[0].rstrip("/") + href
+
+def extract_items_from_search(page) -> List[Dict[str, str]]:
+    items, seen = [], set()
+    anchors = page.locator(SEARCH_RESULT_LINK_SEL)
+    try:
+        count = anchors.count()
+    except Exception:
+        count = 0
+    for i in range(count):
+        a = anchors.nth(i)
+        href = a.get_attribute("href") or ""
+        if not href:
+            continue
+        url = normalize_url(page.url, href)
+        if not DETAIL_URL_RE.search(url) or url in seen:
+            continue
+        seen.add(url)
+        # 可能ならテキスト
+        title = ""
+        try:
+            title = (a.inner_text() or "").strip()
+            if not title:
+                title = (a.locator("xpath=..").inner_text() or "").strip()
+        except Exception:
+            title = ""
+        if len(title) > 200:
+            title = title[:200] + "…"
+        items.append({"title": title, "url": url})
+    return items
+
+def build_html_filename(url: str, prefix: str = "prod") -> str:
+    """
+    商品ページ用の保存名。prefix='search' を渡せば検索ページにも流用可
+    """
     h = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
     tail = url.split("/")[-1] or "page"
     safe_tail = re.sub(r"[^A-Za-z0-9_-]+", "_", tail)
-    return f"{safe_tail}_{h}.html"
+    return f"{prefix}_{safe_tail}_{h}.html"
 
-def save_html(page, url: str, html_dir: Path, *, overwrite: bool=False, wait_selector: str="h1") -> Path:
-    fname = build_html_filename(url)
-    path = html_dir / fname
+def save_html(page, url: str, *, wait_selector: Optional[str] = "h1", overwrite: bool=False, prefix: str="prod") -> Path:
+    fname = build_html_filename(url, prefix=prefix)
+    path = HTML_DIR / fname
     if path.exists() and not overwrite:
         print(f"[SKIP] {url} → {path.name}（既存）")
         return path
@@ -106,11 +133,11 @@ def save_html(page, url: str, html_dir: Path, *, overwrite: bool=False, wait_sel
         except Exception:
             pass
     html = page.content()
-    path.write_text(html, encoding="utf-8")
+    path.write_text(html, encoding="utf-8", errors="ignore")
     print(f"[SAVE] {url} → {path.name}")
     return path
 
-def normalize_url(url: str, base: str = "https://www.2ndstreet.jp/") -> str:
+def normalize_img_url(url: str, base: str = "https://www.2ndstreet.jp/") -> str:
     if not url:
         return ""
     url = url.strip()
@@ -130,28 +157,30 @@ def harvest_images(raw_html: str) -> List[str]:
         u = link.get("href")
         if u: cand.add(u)
     for img in soup.select("img"):
-        for attr in ("src","data-src","data-original","data-lazy","data-image"):
+        for attr in ("src", "data-src", "data-original", "data-lazy", "data-image"):
             u = img.get(attr)
             if not u: continue
-            if ("goods" in u) or u.endswith((".jpg",".jpeg",".png",".webp")):
+            if ("goods" in u) or u.endswith((".jpg", ".jpeg", ".png", ".webp")):
                 cand.add(u)
     normd, seen = [], set()
     for u in cand:
-        nu = normalize_url(u)
+        nu = normalize_img_url(u)
         if nu and nu not in seen:
             seen.add(nu); normd.append(nu)
+
     def score(u: str) -> tuple:
         s1 = 1 if "/goods/" in u or "img/pc/goods" in u else 0
         s2 = 1 if "og" in u else 0
         s3 = -len(u)
         s4 = 1 if re.search(r"[/_-]1(?:[_.-]|\.jpg|\.jpeg|\.png|\.webp)", u) else 0
         return (s1, s4, s2, s3)
+
     normd.sort(key=score, reverse=True)
     return normd
 
 def clean_and_pick_block(raw_html: str) -> str:
     soup = BeautifulSoup(raw_html, "lxml")
-    for tag in soup(["script","style","noscript"]):
+    for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     for c in soup.find_all(string=lambda x: isinstance(x, Comment)):
         c.extract()
@@ -213,7 +242,7 @@ def pick_primary(imgs: List[str]) -> Optional[str]:
             return u
     return imgs[0]
 
-# ========== LLM 抽出 ==========
+# ========== LLM抽出 ==========
 SYSTEM_PROMPT = "You are an information extraction engine. Return ONLY valid JSON with the required keys. No explanations."
 
 def llm_extract(snippet: str) -> Dict[str, Any]:
@@ -294,7 +323,6 @@ def bs_fallback(raw_html: str) -> Dict[str, Any]:
         "shipping_fee": ship,
     }
 
-# ========== 1ファイル解析 ==========
 def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
     raw_html = html_path.read_text(encoding="utf-8", errors="ignore")
     pre_images = harvest_images(raw_html)
@@ -319,7 +347,7 @@ def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
     else:
         pool, uniq, seen = images + pre_images, [], set()
         for u in pool:
-            nu = normalize_url(u)
+            nu = normalize_img_url(u)
             if nu and nu not in seen:
                 seen.add(nu); uniq.append(nu)
         images = uniq
@@ -329,66 +357,228 @@ def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
         data["price"] = "¥" + data["price"]
     return data
 
-# ========== フェーズ1: HTML保存 ==========
-def run_phase_html(headless: bool, overwrite: bool, delay: float, retries: int) -> None:
-    urls = read_all_csv_urls(INPUT_DIR)
-    if not urls:
-        print("[ERROR] input/*.csv にURLが見つかりません。"); sys.exit(1)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    HTML_DIR.mkdir(parents=True, exist_ok=True)
+# ========== CSV I/O ==========
+BASE_HEADERS   = ["url","file","status","saved_at"]
+ENRICH_HEADERS = ["image","product_name","model","categories","condition","price","shipping_fee"]
 
-    saved = 0; failed = 0
+def write_search_results_header():
+    with RESULT_SEARCH_CSV.open("w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=["src_file","src_row","search_page_url","rank","title","url"]).writeheader()
+
+def append_search_results(rows: List[Dict[str, Any]]):
+    with RESULT_SEARCH_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["src_file","src_row","search_page_url","rank","title","url"])
+        w.writerows(rows)
+
+def write_url_map(rows: List[Dict[str, str]]) -> None:
+    with OUT_MAP.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=BASE_HEADERS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+def read_url_map() -> List[Dict[str, str]]:
+    if not OUT_MAP.exists():
+        return []
+    with OUT_MAP.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.DictReader(fp)
+        return list(reader)
+
+def overwrite_url_map_with_enriched(rows: List[Dict[str, str]]) -> None:
+    headers = BASE_HEADERS + ENRICH_HEADERS
+    with OUT_MAP.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+# ========== メイン処理 ==========
+def main():
+    ap = argparse.ArgumentParser(description="2nd STREET: 検索URL→商品URL抽出→HTML保存→解析（shopsId付き）")
+    ap.add_argument("--headless", action="store_true", help="ブラウザをヘッドレスで実行")
+    ap.add_argument("--overwrite", action="store_true", help="既存HTMLを上書き保存")
+    ap.add_argument("--delay", type=float, default=0.5, help="各リクエスト間待機秒（既定0.5）")
+    ap.add_argument("--retries", type=int, default=2, help="保存失敗時のリトライ回数（既定2）")
+    ap.add_argument("--no-llm", action="store_true", help="LLM抽出を使わず常にBSフォールバックを使用")
+    ap.add_argument("--save-search-html", action="store_true", help="検索ページHTMLも保存する（デフォルトは保存しない）")
+    args = ap.parse_args()
+
+    use_llm = (not args.no_llm) and _USE_LLM
+    if args.no_llm:
+        print("[INFO] --no-llm 指定：BeautifulSoupフォールバックのみで解析します。")
+    elif not _USE_LLM:
+        print("[INFO] OPENAI_API_KEY 未設定：BeautifulSoupフォールバックで解析します。")
+
+    ensure_dirs()
+
+    # 1) input/*.csv 読み込み → 検索ページURLの抽出
+    csv_files = list(INPUT_DIR.glob("*.csv"))
+    if not csv_files:
+        print("[ERROR] inputフォルダにCSVが見つかりません。"); sys.exit(1)
+
+    print(f"[INFO] {len(csv_files)}件のCSVを処理します。")
+    write_search_results_header()
+
+    search_urls: List[Dict[str, Any]] = []  # {src_file, src_row, url}
+    for csv_file in csv_files:
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False, encoding="utf-8", engine="python")
+        for idx, row in df.iterrows():
+            urls = find_urls_in_row(row.values)
+            for u in urls:
+                if SEARCH_PAGE_HINT in u:
+                    search_urls.append({"src_file": csv_file.name, "src_row": idx+1, "url": u})
+
+    if not search_urls:
+        print("[ERROR] 検索ページURLが見つかりませんでした（www.2ndstreet.jp/search が0件）。"); sys.exit(1)
+
+    # 2) Playwrightで検索ページを開いて「shopsId を含む」商品詳細URLを抽出
+    product_urls: List[str] = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     with sync_playwright() as p:
-        # 軽いステルス：UA, Viewport, locale/timezone
-        browser = p.chromium.launch(headless=headless)
+        browser = p.chromium.launch(headless=args.headless)
         context = browser.new_context(
-            viewport={"width": 1366, "height": 900},
-            locale="ja-JP", timezone_id="Asia/Tokyo",
-            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"),
+            viewport={"width": 1280, "height": 900},
+            user_agent=UA, locale="ja-JP", timezone_id="Asia/Tokyo"
         )
         page = context.new_page()
-        total = len(urls)
-        for i, url in enumerate(urls, 1):
-            print(f"[{i}/{total}] GET {url}")
-            ok = False; err = None
-            for attempt in range(retries + 1):
+
+        for i, entry in enumerate(search_urls, 1):
+            s_url = entry["url"]
+            print(f"[SEARCH {i}/{len(search_urls)}] {s_url}")
+            try:
+                page.goto(s_url, wait_until="domcontentloaded", timeout=60000)
+            except PWTimeout:
+                print("  [WARN] タイムアウト、続行します。")
+            time.sleep(1.0)
+
+            # （任意）検索ページHTML保存
+            if args.save_search_html:
                 try:
-                    save_html(page, url, HTML_DIR, overwrite=overwrite)
+                    save_html(page, s_url, wait_selector=None, overwrite=args.overwrite, prefix="search")
+                except Exception as e:
+                    print(f"  [WARN] 検索HTML保存失敗: {e}")
+
+            # 商品URL抽出
+            rows_to_write = []
+            try:
+                items = extract_items_from_search(page)
+                print(f"  [INFO] {len(items)}件検出")
+                for rank, it in enumerate(items, start=1):
+                    rows_to_write.append({
+                        "src_file": entry["src_file"],
+                        "src_row": entry["src_row"],
+                        "search_page_url": s_url,
+                        "rank": rank,
+                        "title": it["title"],
+                        "url": it["url"]
+                    })
+                    product_urls.append(it["url"])
+            except Exception as e:
+                print(f"  [ERROR] 抽出失敗: {e}")
+
+            if rows_to_write:
+                append_search_results(rows_to_write)
+
+            if args.delay > 0:
+                time.sleep(args.delay)
+
+        browser.close()
+
+    # 商品URLをユニーク化
+    uniq_products: List[str] = []
+    seen = set()
+    for u in product_urls:
+        if u not in seen:
+            seen.add(u); uniq_products.append(u)
+
+    if not uniq_products:
+        print("[ERROR] 商品URL（shopsId含む）が抽出できませんでした。"); sys.exit(1)
+
+    # 3) 商品ページHTML保存 → url_map.csv（素状態）作成
+    print(f"[INFO] 商品ページ保存を開始（{len(uniq_products)}件）")
+    map_rows: List[Dict[str, str]] = []
+    saved = failed = 0
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=args.headless)
+        context = browser.new_context(
+            viewport={"width": 1366, "height": 900},
+            user_agent=UA, locale="ja-JP", timezone_id="Asia/Tokyo"
+        )
+        page = context.new_page()
+
+        for i, url in enumerate(uniq_products, 1):
+            print(f"[PROD {i}/{len(uniq_products)}] GET {url}")
+            fname = build_html_filename(url, prefix="prod")
+            status = "saved"
+            ok = False; err: Optional[Exception] = None
+            for attempt in range(args.retries + 1):
+                try:
+                    save_html(page, url, wait_selector="h1", overwrite=args.overwrite, prefix="prod")
                     ok = True; break
                 except Exception as e:
                     err = e
                     print(f"  ↳ attempt {attempt+1} failed: {e}")
                     time.sleep(1.0)
-            if ok: saved += 1
+            if ok:
+                saved += 1
             else:
                 failed += 1
+                status = f"fail:{type(err).__name__}" if err else "fail"
                 print(f"[FAIL] {url} : {err}")
-            if delay > 0:
-                time.sleep(delay)
+            if args.delay > 0:
+                time.sleep(args.delay)
+
+            map_rows.append({
+                "url": url,
+                "file": fname if ok or (HTML_DIR / fname).exists() else "",
+                "status": status if (ok or status.startswith("fail")) else "skipped",
+                "saved_at": now,
+            })
+
         browser.close()
-    print("\n===== PHASE[HTML] SUMMARY =====")
+
+    write_url_map(map_rows)
+    print("\n===== SAVE SUMMARY =====")
     print(f"Saved : {saved}")
     print(f"Failed: {failed}")
     print(f"Dir   : {HTML_DIR.resolve()}")
-    print("================================\n")
+    print(f"Map   : {OUT_MAP.resolve()}")
+    print("========================\n")
 
-# ========== フェーズ2: 解析→CSV ==========
-def run_phase_parse(use_llm: bool=True) -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    if not HTML_DIR.exists():
-        raise SystemExit(f"[ERROR] フォルダがありません: {HTML_DIR}")
-    files = sorted(HTML_DIR.glob("*.html"))
-    if not files:
-        raise SystemExit(f"[WARN] HTMLが見つかりません: {HTML_DIR}")
-    rows = []
-    print(f"[INFO] {len(files)} 件のHTMLを処理します")
-    for i, f in enumerate(files, 1):
+    # 4) 解析 → url_map に情報付与して上書き、result.csvにも同内容を書き出し
+    print("[INFO] 解析フェーズを開始します")
+    enriched_rows: List[Dict[str, str]] = []
+    proc = skip = 0
+    map_rows = read_url_map()
+    total = len(map_rows)
+    if not map_rows:
+        print(f"[WARN] 中間CSVが空です: {OUT_MAP}")
+
+    for i, row in enumerate(map_rows, 1):
+        url = row.get("url", "")
+        fname = row.get("file", "")
+        status = row.get("status", "")
+        base = {k: row.get(k, "") for k in BASE_HEADERS}
+
+        if not fname or status.startswith("fail"):
+            skip += 1
+            print(f"[SKIP] {i}/{total} {url} （fileなし/失敗行）")
+            base.update({k: "" for k in ENRICH_HEADERS})
+            enriched_rows.append(base)
+            continue
+
+        fpath = HTML_DIR / fname
+        if not fpath.exists():
+            skip += 1
+            print(f"[SKIP] {i}/{total} {url} （HTML未存在: {fname}）")
+            base.update({k: "" for k in ENRICH_HEADERS})
+            enriched_rows.append(base)
+            continue
+
         try:
-            data = process_file(f, use_llm=use_llm)
-            rows.append({
-                "file": f.name,
+            data = process_file(fpath, use_llm=use_llm)
+            proc += 1
+            base.update({
                 "image": (data.get("images") or [""])[0],
                 "product_name": data.get("product_name", ""),
                 "model": data.get("model", ""),
@@ -397,38 +587,26 @@ def run_phase_parse(use_llm: bool=True) -> None:
                 "price": data.get("price", ""),
                 "shipping_fee": data.get("shipping_fee", ""),
             })
-            print(f"[OK] {i}/{len(files)} {f.name}")
-            time.sleep(0.4)  # 軽いレート調整
+            enriched_rows.append(base)
+            print(f"[OK] {i}/{total} {fname}")
+            time.sleep(0.2)
         except Exception as e:
-            print(f"[ERROR] {f.name}: {e}")
-    fieldnames = ["file","image","product_name","model","categories","condition","price","shipping_fee"]
+            print(f"[ERROR] {fname}: {e}")
+            base.update({k: "" for k in ENRICH_HEADERS})
+            enriched_rows.append(base)
+
+    overwrite_url_map_with_enriched(enriched_rows)
+
+    headers = BASE_HEADERS + ENRICH_HEADERS
     with OUT_CSV.open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer = csv.DictWriter(fp, fieldnames=headers)
         writer.writeheader()
-        writer.writerows(rows)
-    print(f"\n[✅ 完了] {len(rows)}件を書き出し: {OUT_CSV}")
+        writer.writerows(enriched_rows)
 
-# ========== エントリポイント ==========
-def main():
-    ap = argparse.ArgumentParser(description="2nd STREET: HTML保存→解析まで一気通貫")
-    ap.add_argument("--phase", choices=["both","html","parse"], default="both", help="実行フェーズ（既定 both）")
-    ap.add_argument("--headless", action="store_true", help="保存時にヘッドレスで実行")
-    ap.add_argument("--overwrite", action="store_true", help="既存HTMLを上書き保存")
-    ap.add_argument("--delay", type=float, default=0.5, help="保存フェーズの各リクエスト間待機秒（既定0.5）")
-    ap.add_argument("--retries", type=int, default=2, help="保存失敗時のリトライ回数（既定2）")
-    ap.add_argument("--no-llm", action="store_true", help="LLM抽出を使わず常にBSフォールバックを使用")
-    args = ap.parse_args()
-
-    use_llm = (not args.no_llm) and _USE_LLM
-    if args.no_llm:
-        print("[INFO] --no-llm 指定のため、BeautifulSoupフォールバックのみで解析します。")
-    elif not _USE_LLM:
-        print("[INFO] OPENAI_API_KEY 未設定のため、BeautifulSoupフォールバックで解析します。")
-
-    if args.phase in ("both","html"):
-        run_phase_html(headless=args.headless, overwrite=args.overwrite, delay=args.delay, retries=args.retries)
-    if args.phase in ("both","parse"):
-        run_phase_parse(use_llm=use_llm)
+    print(f"\n[✅ 完了] 解析 {proc} 件 / スキップ {skip} 件")
+    print(f"[WRITE] {OUT_CSV.resolve()}")
+    print(f"[WRITE] {OUT_MAP.resolve()}（商品情報 付与済）")
+    print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（検索→商品URL 抽出ログ）")
 
 if __name__ == "__main__":
     main()
