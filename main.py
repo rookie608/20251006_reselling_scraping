@@ -60,11 +60,11 @@ try:
     if not _OPENAI_KEY:
         _USE_LLM = False
         OpenAI = None  # type: ignore
-        APIError = RateLimitError = BadRequestError = Exception  # type: ignore
     else:
         client = OpenAI(api_key=_OPENAI_KEY)
 except Exception:
     _USE_LLM = False
+    APIError = RateLimitError = BadRequestError = Exception  # type: ignore
 
 # ========== 共通ユーティリティ ==========
 def ensure_dirs() -> None:
@@ -392,7 +392,7 @@ def bs_fallback(raw_html: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # model（RB2180など）
+    # model（RB2180などの簡易検出例）
     model = ""
     mm = re.search(r"\bRB\d+[A-Z]?\b", raw_html, flags=re.IGNORECASE)
     if mm: model = mm.group(0)
@@ -648,12 +648,15 @@ def main():
 
     # 4) 解析 → url_map に情報付与して上書き、result.csvにも同内容を書き出し
     print("[INFO] 解析フェーズを開始します")
+    RESULT_HEADERS = BASE_HEADERS + [h for h in ENRICH_HEADERS if h != "model"]
     enriched_rows: List[Dict[str, str]] = []
     proc = skip = 0
     map_rows = read_url_map()
     total = len(map_rows)
     if not map_rows:
         print(f"[WARN] 中間CSVが空です: {OUT_MAP}")
+
+    use_llm = (not args.no_llm) and _USE_LLM  # ← 念のためここでも確定
 
     for i, row in enumerate(map_rows, 1):
         url = row.get("url", "")
@@ -699,9 +702,13 @@ def main():
 
     overwrite_url_map_with_enriched(enriched_rows)
 
-    headers = BASE_HEADERS + ENRICH_HEADERS
+    # === ここだけ変更：result.csv は model を除外 + 余分キー無視 ===
     with OUT_CSV.open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(fp, fieldnames=headers)
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=RESULT_HEADERS,
+            extrasaction="ignore"  # ← 'model' など fieldnames 外キーは無視
+        )
         writer.writeheader()
         writer.writerows(enriched_rows)
 
