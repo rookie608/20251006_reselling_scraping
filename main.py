@@ -242,6 +242,81 @@ def pick_primary(imgs: List[str]) -> Optional[str]:
             return u
     return imgs[0]
 
+# ========== 金額正規化ユーティリティ（数字出力用） ==========
+_MONEY_NUM_RE = re.compile(r"(\d[\d,]*)")
+def _to_int_or_empty(s: str) -> str:
+    """金額文字列から整数（文字列として）を返す。未検出は空、'無料'は0。"""
+    if not s:
+        return ""
+    s = str(s)
+    if "無料" in s or "送料無料" in s:
+        return "0"
+    m = _MONEY_NUM_RE.search(s)
+    if not m:
+        return ""
+    return str(int(m.group(1).replace(",", "")))
+
+# ========== Brand helper ==========
+KNOWN_BRANDS = [
+    "Ray-Ban","RAYBAN","RAY-BAN","GUCCI","COACH","PRADA","FENDI","CELINE","CHANEL",
+    "HERMES","LOUIS VUITTON","VUITTON","BOTTEGA VENETA","BOTTEGA","SAINT LAURENT",
+    "YVES SAINT LAURENT","DIOR","BURBERRY","MIU MIU","BALENCIAGA","MONCLER","NIKE",
+    "ADIDAS","THE NORTH FACE","SUPREME","NEW BALANCE","ASICS","OAKLEY","TOM FORD",
+    "GENTLE MONSTER","OLIVER PEOPLES","EYEVAN","JINS","ZOFF","KATE SPADE"
+]
+
+def extract_brand(raw_html: str, soup: BeautifulSoup) -> str:
+    # 1) JSON-LD Product > brand.name
+    for tag in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(tag.string or "")
+            if isinstance(data, dict):
+                datas = [data]
+            elif isinstance(data, list):
+                datas = data
+            else:
+                datas = []
+            for d in datas:
+                if isinstance(d, dict) and d.get("@type") in ("Product","Offer","AggregateOffer"):
+                    b = d.get("brand")
+                    if isinstance(b, dict):
+                        nm = b.get("name")
+                        if nm: return nm.strip()
+                    elif isinstance(b, str) and b.strip():
+                        return b.strip()
+        except Exception:
+            pass
+
+    # 2) 画面上のラベル（見出しや .brand など）
+    cand_nodes = soup.select("h1, h2, h3, .brand, [class*='brand'], [data-brand]")
+    for n in cand_nodes:
+        txt = (n.get_text(" ", strip=True) or "")
+        if 1 <= len(txt) <= 40:
+            for kb in KNOWN_BRANDS:
+                if kb.lower() in txt.lower():
+                    return kb
+            if re.match(r"^[A-Za-z][\w\s\-.&']{1,38}$", txt):
+                return txt
+
+    # 3) <title> 先頭語
+    title = (soup.title.get_text(strip=True) if soup.title else "") or ""
+    m = re.match(r"^\s*([A-Za-z][\w\-. '&]{1,38})\b", title)
+    if m:
+        head = m.group(1)
+        for kb in KNOWN_BRANDS:
+            if kb.lower() in head.lower():
+                return kb
+        if len(head) >= 2:
+            return head
+
+    # 4) HTML全文から既知ブランド出現
+    low = raw_html.lower()
+    for kb in KNOWN_BRANDS:
+        if kb.lower() in low:
+            return kb
+
+    return ""
+
 # ========== LLM抽出 ==========
 SYSTEM_PROMPT = "You are an information extraction engine. Return ONLY valid JSON with the required keys. No explanations."
 
@@ -254,6 +329,7 @@ def llm_extract(snippet: str) -> Dict[str, Any]:
 {
   "images": string[],
   "product_name": string,
+  "brand": string,
   "model": string,
   "categories": string[],
   "condition": string,
@@ -261,7 +337,7 @@ def llm_extract(snippet: str) -> Dict[str, Any]:
   "shipping_fee": string
 }
 
-- 値はページ表記を尊重
+- 値はページ表記を尊重（例：¥6,490 / 送料：¥770 / 送料無料 など）。ただし数値化は後段で行います。
 - 見つからない項目は空文字または空配列
 - 絶対にJSON以外の出力をしない
 
@@ -282,17 +358,28 @@ def llm_extract(snippet: str) -> Dict[str, Any]:
 # ========== BeautifulSoup フォールバック ==========
 def bs_fallback(raw_html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(raw_html, "lxml")
+
+    # product_name（タイトルから軽整形）
     title = soup.title.get_text(strip=True) if soup.title else ""
     product_name = re.sub(r"\s*\|\s*中古品の販売・通販ならセカンドストリート.*$", "", title)
-    price = ""
+
+    # brand
+    brand = extract_brand(raw_html, soup)
+
+    # price（まずは原文を拾い、後段で数値化）
+    price_raw = ""
     m = re.search(r"¥\s*[\d,]+", raw_html)
-    if m: price = m.group(0)
+    if m: price_raw = m.group(0)
+
+    # condition
     condition = ""
     for s in soup.stripped_strings:
         if "商品の状態" in s or re.search(r"中古[ABCD]|未使用品?", s):
             mc = re.search(r"(中古[ABCD]|未使用品?)", s)
             if mc:
                 condition = mc.group(1); break
+
+    # categories（パンくずのJSON-LD）
     cats = []
     for tag in soup.select('script[type="application/ld+json"]'):
         try:
@@ -304,23 +391,27 @@ def bs_fallback(raw_html: str) -> Dict[str, Any]:
                         cats.append(nm)
         except Exception:
             pass
+
+    # model（RB2180など）
     model = ""
-    mm = re.search(r"\bRB\d+[A-Z]?\b", raw_html)
+    mm = re.search(r"\bRB\d+[A-Z]?\b", raw_html, flags=re.IGNORECASE)
     if mm: model = mm.group(0)
-    ship = ""
-    ms = re.search(r"送料[:：]?\s*¥?\s*[\d,]+", raw_html)
+
+    # shipping fee（原文）
+    ship_raw = ""
+    ms = re.search(r"(送料[^<]{0,10})?¥?\s*[\d,]+|送料無料", raw_html)
     if ms:
-        ship = ms.group(0)
-        mprice = re.search(r"¥\s*[\d,]+", ship)
-        if mprice: ship = mprice.group(0)
+        ship_raw = ms.group(0)
+
     return {
         "images": [],
         "product_name": product_name,
+        "brand": brand,
         "model": model,
         "categories": cats,
         "condition": condition,
-        "price": price,
-        "shipping_fee": ship,
+        "price": price_raw,         # 数値化は後段
+        "shipping_fee": ship_raw,   # 数値化は後段
     }
 
 def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
@@ -341,6 +432,8 @@ def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
             data = bs_fallback(raw_html)
     else:
         data = bs_fallback(raw_html)
+
+    # 画像マージと正規化
     images = data.get("images") or []
     if not images and pre_images:
         images = pre_images
@@ -353,13 +446,21 @@ def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
         images = uniq
     primary = pick_primary(images)
     data["images"] = [primary] if primary else []
-    if data.get("price") and re.fullmatch(r"\d[\d,]*", data["price"]):
-        data["price"] = "¥" + data["price"]
+
+    # === ここで金額を数値化（文字列の整数） ===
+    data["price"] = _to_int_or_empty(data.get("price", ""))
+    data["shipping_fee"] = _to_int_or_empty(data.get("shipping_fee", ""))
+
+    # brand が空ならフォールバック抽出
+    if not data.get("brand"):
+        soup = BeautifulSoup(raw_html, "lxml")
+        data["brand"] = extract_brand(raw_html, soup)
+
     return data
 
 # ========== CSV I/O ==========
 BASE_HEADERS   = ["url","file","status","saved_at"]
-ENRICH_HEADERS = ["image","product_name","model","categories","condition","price","shipping_fee"]
+ENRICH_HEADERS = ["image","product_name","brand","model","categories","condition","price","shipping_fee"]
 
 def write_search_results_header():
     with RESULT_SEARCH_CSV.open("w", newline="", encoding="utf-8") as f:
@@ -581,11 +682,12 @@ def main():
             base.update({
                 "image": (data.get("images") or [""])[0],
                 "product_name": data.get("product_name", ""),
+                "brand": data.get("brand", ""),
                 "model": data.get("model", ""),
                 "categories": " > ".join(data.get("categories", [])),
                 "condition": data.get("condition", ""),
-                "price": data.get("price", ""),
-                "shipping_fee": data.get("shipping_fee", ""),
+                "price": data.get("price", ""),               # ← 数字のみ（例：6490）
+                "shipping_fee": data.get("shipping_fee", ""), # ← 数字のみ（例：770 / 0）
             })
             enriched_rows.append(base)
             print(f"[OK] {i}/{total} {fname}")
