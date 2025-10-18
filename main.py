@@ -4,23 +4,15 @@
 2nd STREET 一気通貫パイプライン：
   input/*.csv にある「検索ページURL」を開いて商品詳細URL(shopsId含む)を抽出
    → 商品ページHTMLを保存
-   → HTMLを解析して output/result.csv へ出力
-   → 中間の url_map.csv も商品情報付で上書き保存
-   → （追加）result.csv を読み込み、OpenAIで検索キーワード列 search_keyword を生成して
-      output/result_with_まとめ.csv を出力
+   → HTMLを解析して output/url_map_YYYYMMDDHHMM.csv へ出力（最終成果はこの1本）
+   → （追加）url_map_YYYYMMDDHHMM.csv を読み込み、OpenAIで検索キーワード列 search_keyword を生成して
+      output/result_with_まとめ_YYYYMMDDHHMM.csv を出力
 
 出力：
-- output/secondstreet_results.csv : 検索ページ→商品URLの抽出結果（順位つき）
-- output/url_map.csv              : 商品URL↔HTMLファイル対応（最終的に情報付与で上書き）
-- output/result.csv               : url_map と同一構造の最終結果CSV（※ model 列は除外）
-- output/result_with_まとめ.csv : result.csv + search_keyword 列
-- output/html/*.html              : 保存した商品ページ（必要に応じて検索ページも）
-
-実行例：
-  pip install playwright beautifulsoup4 lxml pandas python-dotenv openai
-  playwright install
-  python scrape_secondstreet_pipeline.py --headless
-  # OpenAI抽出/キーワード生成を使う場合は OPENAI_API_KEY を設定
+- output/secondstreet_results_YYYYMMDDHHMM.csv : 検索ページ→商品URLの抽出結果（順位つき）
+- output/url_map_YYYYMMDDHHMM.csv              : 商品URL↔HTML対応 + 解析情報（最終成果。※ model 列は保持）
+- output/result_with_まとめ_YYYYMMDDHHMM.csv   : url_map 上に search_keyword 列を付与したもの
+- output/html/*.html                           : 保存した商品ページ（必要に応じて検索ページも）
 """
 
 import os, re, csv, json, time, argparse, hashlib, urllib.parse, sys
@@ -44,10 +36,13 @@ INPUT_DIR = BASE_DIR / "input"
 OUT_DIR   = BASE_DIR / "output"
 HTML_DIR  = OUT_DIR / "html"
 
-RESULT_SEARCH_CSV = OUT_DIR / "secondstreet_results.csv"  # 検索→商品URLの記録
-OUT_MAP           = OUT_DIR / "url_map.csv"               # 商品URL↔HTML, 最終的に情報付与で上書き
-OUT_CSV           = OUT_DIR / "result.csv"                # 同内容を別名出力
-OUT_CSV_KW        = OUT_DIR / "result_with_まとめ.csv"  # （追加）検索ワード付き最終CSV
+# ★変更: 実行時刻サフィックス（例: 202510151000）
+RUN_STAMP = datetime.now().strftime("%Y%m%d%H%M")
+
+# ★変更: タイムスタンプ付きの出力ファイル名に統一
+RESULT_SEARCH_CSV = OUT_DIR / f"secondstreet_results_{RUN_STAMP}.csv"   # 検索→商品URLの記録
+OUT_MAP           = OUT_DIR / f"url_map_{RUN_STAMP}.csv"               # 最終成果（解析後もこれを上書き）
+OUT_CSV_KW        = OUT_DIR / f"result_with_まとめ_{RUN_STAMP}.csv"     # 検索ワード付き最終CSV
 
 # ========== 設定 ==========
 UA = (
@@ -108,7 +103,6 @@ def extract_items_from_search(page) -> List[Dict[str, str]]:
         if not DETAIL_URL_RE.search(url) or url in seen:
             continue
         seen.add(url)
-        # 可能ならテキスト
         title = ""
         try:
             title = (a.inner_text() or "").strip()
@@ -252,10 +246,9 @@ def pick_primary(imgs: List[str]) -> Optional[str]:
             return u
     return imgs[0]
 
-# ========== 金額正規化ユーティリティ（数字出力用） ==========
+# ========== 金額正規化ユーティリティ ==========
 _MONEY_NUM_RE = re.compile(r"(\d[\d,]*)")
 def _to_int_or_empty(s: str) -> str:
-    """金額文字列から整数（文字列として）を返す。未検出は空、'無料'は0。"""
     if not s:
         return ""
     s = str(s)
@@ -297,7 +290,7 @@ def extract_brand(raw_html: str, soup: BeautifulSoup) -> str:
         except Exception:
             pass
 
-    # 2) 画面上のラベル（見出しや .brand など）
+    # 2) ラベル類
     cand_nodes = soup.select("h1, h2, h3, .brand, [class*='brand'], [data-brand]")
     for n in cand_nodes:
         txt = (n.get_text(" ", strip=True) or "")
@@ -319,7 +312,7 @@ def extract_brand(raw_html: str, soup: BeautifulSoup) -> str:
         if len(head) >= 2:
             return head
 
-    # 4) HTML全文から既知ブランド出現
+    # 4) 既知ブランド出現
     low = raw_html.lower()
     for kb in KNOWN_BRANDS:
         if kb.lower() in low:
@@ -369,19 +362,15 @@ def llm_extract(snippet: str) -> Dict[str, Any]:
 def bs_fallback(raw_html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(raw_html, "lxml")
 
-    # product_name（タイトルから軽整形）
     title = soup.title.get_text(strip=True) if soup.title else ""
     product_name = re.sub(r"\s*\|\s*中古品の販売・通販ならセカンドストリート.*$", "", title)
 
-    # brand
     brand = extract_brand(raw_html, soup)
 
-    # price（まずは原文を拾い、後段で数値化）
     price_raw = ""
     m = re.search(r"¥\s*[\d,]+", raw_html)
     if m: price_raw = m.group(0)
 
-    # condition
     condition = ""
     for s in soup.stripped_strings:
         if "商品の状態" in s or re.search(r"中古[ABCD]|未使用品?", s):
@@ -389,7 +378,6 @@ def bs_fallback(raw_html: str) -> Dict[str, Any]:
             if mc:
                 condition = mc.group(1); break
 
-    # categories（パンくずのJSON-LD）
     cats = []
     for tag in soup.select('script[type="application/ld+json"]'):
         try:
@@ -402,12 +390,10 @@ def bs_fallback(raw_html: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # model（RB2180など）
     model = ""
     mm = re.search(r"\bRB\d+[A-Z]?\b", raw_html, flags=re.IGNORECASE)
     if mm: model = mm.group(0)
 
-    # shipping fee（原文）
     ship_raw = ""
     ms = re.search(r"(送料[^<]{0,10})?¥?\s*[\d,]+|送料無料", raw_html)
     if ms:
@@ -420,8 +406,8 @@ def bs_fallback(raw_html: str) -> Dict[str, Any]:
         "model": model,
         "categories": cats,
         "condition": condition,
-        "price": price_raw,         # 数値化は後段
-        "shipping_fee": ship_raw,   # 数値化は後段
+        "price": price_raw,
+        "shipping_fee": ship_raw,
     }
 
 def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
@@ -443,7 +429,6 @@ def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
     else:
         data = bs_fallback(raw_html)
 
-    # 画像マージと正規化
     images = data.get("images") or []
     if not images and pre_images:
         images = pre_images
@@ -457,11 +442,9 @@ def process_file(html_path: Path, use_llm: bool=True) -> Dict[str, Any]:
     primary = pick_primary(images)
     data["images"] = [primary] if primary else []
 
-    # === ここで金額を数値化（文字列の整数） ===
     data["price"] = _to_int_or_empty(data.get("price", ""))
     data["shipping_fee"] = _to_int_or_empty(data.get("shipping_fee", ""))
 
-    # brand が空ならフォールバック抽出
     if not data.get("brand"):
         soup = BeautifulSoup(raw_html, "lxml")
         data["brand"] = extract_brand(raw_html, soup)
@@ -561,14 +544,12 @@ def main():
                 print("  [WARN] タイムアウト、続行します。")
             time.sleep(1.0)
 
-            # （任意）検索ページHTML保存
             if args.save_search_html:
                 try:
                     save_html(page, s_url, wait_selector=None, overwrite=args.overwrite, prefix="search")
                 except Exception as e:
                     print(f"  [WARN] 検索HTML保存失敗: {e}")
 
-            # 商品URL抽出
             rows_to_write = []
             try:
                 items = extract_items_from_search(page)
@@ -604,7 +585,7 @@ def main():
     if not uniq_products:
         print("[ERROR] 商品URL（shopsId含む）が抽出できませんでした。"); sys.exit(1)
 
-    # 3) 商品ページHTML保存 → url_map.csv（素状態）作成
+    # 3) 商品ページHTML保存 → url_map_*.csv（素状態）作成
     print(f"[INFO] 商品ページ保存を開始（{len(uniq_products)}件）")
     map_rows: List[Dict[str, str]] = []
     saved = failed = 0
@@ -656,9 +637,11 @@ def main():
     print(f"Map   : {OUT_MAP.resolve()}")
     print("========================\n")
 
-    # 4) 解析 → url_map に情報付与して上書き、result.csvにも同内容を書き出し
+    # 4) 解析 → url_map_* に情報付与で上書き（★OUT_CSVは廃止）
     print("[INFO] 解析フェーズを開始します")
-    RESULT_HEADERS = BASE_HEADERS + [h for h in ENRICH_HEADERS if h != "model"]
+    # ★変更: 最終成果は url_map（model列も保持）。旧result.csvは出力しない。
+    RESULT_HEADERS = BASE_HEADERS + ENRICH_HEADERS  # model も保持する方針に変更
+
     enriched_rows: List[Dict[str, str]] = []
     proc = skip = 0
     map_rows = read_url_map()
@@ -697,8 +680,8 @@ def main():
                 "model": data.get("model", ""),
                 "categories": " > ".join(data.get("categories", [])),
                 "condition": data.get("condition", ""),
-                "price": data.get("price", ""),               # 数字のみ（例：6490）
-                "shipping_fee": data.get("shipping_fee", ""), # 数字のみ（例：770 / 0）
+                "price": data.get("price", ""),
+                "shipping_fee": data.get("shipping_fee", ""),
             })
             enriched_rows.append(base)
             print(f"[OK] {i}/{total} {fname}")
@@ -710,29 +693,18 @@ def main():
 
     overwrite_url_map_with_enriched(enriched_rows)
 
-    # result.csv は model を除外 + 余分キー無視
-    with OUT_CSV.open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(
-            fp,
-            fieldnames=RESULT_HEADERS,
-            extrasaction="ignore"
-        )
-        writer.writeheader()
-        writer.writerows(enriched_rows)
-
     print(f"\n[✅ 完了] 解析 {proc} 件 / スキップ {skip} 件")
-    print(f"[WRITE] {OUT_CSV.resolve()}")
     print(f"[WRITE] {OUT_MAP.resolve()}（商品情報 付与済）")
     print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（検索→商品URL 抽出ログ）")
 
-    # 5) （追加）検索キーワード生成 → result_with_まとめ.csv
+    # 5) （追加）検索キーワード生成 → result_with_まとめ_*.csv
     try:
         append_search_keywords()
     except Exception as e:
         print(f"[WARN] 検索キーワード生成に失敗しました: {e}")
-        # 最低限、検索キーワード列を空で書き出す
+        # 最低限、検索キーワード列を空で書き出す（★OUT_MAPを読む）
         try:
-            df_tmp = pd.read_csv(OUT_CSV)
+            df_tmp = pd.read_csv(OUT_MAP)
             if "search_keyword" not in df_tmp.columns:
                 df_tmp["search_keyword"] = ""
             df_tmp.to_csv(OUT_CSV_KW, index=False, encoding="utf-8-sig")
@@ -765,7 +737,6 @@ product_name: {product_name}
 上記に対して、出力ルールに従い検索キーワードを1行で出力してください。"""
 
 def _get_kw_client() -> Optional["OpenAI"]:
-    # 既存 client があれば流用、なければ .env を読んで作成
     if 'client' in globals() and isinstance(globals()['client'], object):
         return globals().get('client')  # type: ignore
     if load_dotenv:
@@ -807,19 +778,18 @@ def _generate_keyword(client_obj: "OpenAI", brand: str, product_name: str) -> st
             print(f"[WARN] OpenAI API エラー {e} → {wait:.1f}s 待機 ({attempt}/{KW_MAX_RETRIES})")
             time.sleep(wait)
 
-    # 連続失敗時フォールバック：ブランド単独
     return brand
 
 def append_search_keywords() -> None:
     """
-    output/result.csv を読み込み、brand/product_name を用いて
-    search_keyword を生成し、output/result_with_まとめ.csv に保存。
+    OUT_MAP（url_map_*.csv）を読み込み、brand/product_name を用いて
+    search_keyword を生成し、result_with_まとめ_*.csv に保存。
     """
-    if not OUT_CSV.exists():
-        raise FileNotFoundError(f"{OUT_CSV} が見つかりません。前段の解析が成功しているか確認してください。")
+    if not OUT_MAP.exists():
+        raise FileNotFoundError(f"{OUT_MAP} が見つかりません。前段の解析が成功しているか確認してください。")
 
-    print(f"[INFO] キーワード生成: 読み込み {OUT_CSV}")
-    df = pd.read_csv(OUT_CSV, dtype=str, keep_default_na=False)
+    print(f"[INFO] キーワード生成: 読み込み {OUT_MAP}")
+    df = pd.read_csv(OUT_MAP, dtype=str, keep_default_na=False)
 
     # 列の存在保証
     if "brand" not in df.columns:
