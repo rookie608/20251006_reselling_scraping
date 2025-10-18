@@ -10,14 +10,14 @@
 
 出力：
 - output/secondstreet_results_YYYYMMDDHHMM.csv : 検索ページ→商品URLの抽出結果（順位つき）
-- output/url_map_YYYYMMDDHHMM.csv              : 商品URL↔HTML対応 + 解析情報（最終成果。※ model 列は保持）
+- output/url_map_YYYYMMDDHHMM.csv              : 商品URL↔HTML対応 + 解析情報（最終成果）
 - output/result_with_まとめ_YYYYMMDDHHMM.csv   : url_map 上に search_keyword 列を付与したもの
 - output/html/*.html                           : 保存した商品ページ（必要に応じて検索ページも）
 """
 
 import os, re, csv, json, time, argparse, hashlib, urllib.parse, sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Iterable
+from typing import List, Dict, Any, Optional, Iterable, Set
 from datetime import datetime
 
 import pandas as pd
@@ -36,10 +36,10 @@ INPUT_DIR = BASE_DIR / "input"
 OUT_DIR   = BASE_DIR / "output"
 HTML_DIR  = OUT_DIR / "html"
 
-# ★変更: 実行時刻サフィックス（例: 202510151000）
+# 実行時刻サフィックス（例: 202510151000）
 RUN_STAMP = datetime.now().strftime("%Y%m%d%H%M")
 
-# ★変更: タイムスタンプ付きの出力ファイル名に統一
+# タイムスタンプ付きの出力ファイル名
 RESULT_SEARCH_CSV = OUT_DIR / f"secondstreet_results_{RUN_STAMP}.csv"   # 検索→商品URLの記録
 OUT_MAP           = OUT_DIR / f"url_map_{RUN_STAMP}.csv"               # 最終成果（解析後もこれを上書き）
 OUT_CSV_KW        = OUT_DIR / f"result_with_まとめ_{RUN_STAMP}.csv"     # 検索ワード付き最終CSV
@@ -116,9 +116,6 @@ def extract_items_from_search(page) -> List[Dict[str, str]]:
     return items
 
 def build_html_filename(url: str, prefix: str = "prod") -> str:
-    """
-    商品ページ用の保存名。prefix='search' を渡せば検索ページにも流用可
-    """
     h = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
     tail = url.split("/")[-1] or "page"
     safe_tail = re.sub(r"[^A-Za-z0-9_-]+", "_", tail)
@@ -484,6 +481,36 @@ def overwrite_url_map_with_enriched(rows: List[Dict[str, str]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+# ========== ★変更(重複排除): 直近の secondstreet_results_*.csv を探してURL集合を得る ==========
+RESULTS_NAME_RE = re.compile(r"secondstreet_results_(\d{12})\.csv$", re.IGNORECASE)
+
+def _find_latest_previous_results_path(exclude_path: Path) -> Optional[Path]:
+    """
+    output/secondstreet_results_*.csv から、末尾12桁の日時を見て最新を返す。
+    今回の実行で書いている RESULT_SEARCH_CSV は除外。
+    """
+    cands = []
+    for p in OUT_DIR.glob("secondstreet_results_*.csv"):
+        if p.resolve() == exclude_path.resolve():
+            continue
+        m = RESULTS_NAME_RE.search(p.name)
+        if m:
+            cands.append((m.group(1), p))
+    if not cands:
+        return None
+    # stampが大きい=新しい
+    cands.sort(key=lambda t: t[0], reverse=True)
+    return cands[0][1]
+
+def _read_url_set_from_results(path: Path) -> Set[str]:
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8")
+    except Exception:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)  # encodingフォールバック
+    if "url" not in df.columns:
+        return set()
+    return set(str(u) for u in df["url"].dropna().astype(str))
+
 # ========== ここからメイン処理 ==========
 def main():
     ap = argparse.ArgumentParser(description="2nd STREET: 検索URL→商品URL抽出→HTML保存→解析（shopsId付き）")
@@ -544,12 +571,14 @@ def main():
                 print("  [WARN] タイムアウト、続行します。")
             time.sleep(1.0)
 
+            # （任意）検索ページHTML保存
             if args.save_search_html:
                 try:
                     save_html(page, s_url, wait_selector=None, overwrite=args.overwrite, prefix="search")
                 except Exception as e:
                     print(f"  [WARN] 検索HTML保存失敗: {e}")
 
+            # 商品URL抽出
             rows_to_write = []
             try:
                 items = extract_items_from_search(page)
@@ -575,18 +604,37 @@ def main():
 
         browser.close()
 
-    # 商品URLをユニーク化
-    uniq_products: List[str] = []
-    seen = set()
+    # ★変更(重複排除): 前回最新の secondstreet_results_*.csv の URL と比較して、新規のみ残す
+    prev_path = _find_latest_previous_results_path(RESULT_SEARCH_CSV)
+    prev_urls: Set[str] = set()
+    if prev_path:
+        prev_urls = _read_url_set_from_results(prev_path)
+        print(f"[INFO] 直近の結果: {prev_path.name}（URL {len(prev_urls)}件）を読み込み、重複を除外します。")
+    else:
+        print("[INFO] 過去の secondstreet_results_*.csv が見つかりません（初回として全件処理）。")
+
+    # 現在抽出の重複除去（同一URLの二重検出も排除）
+    uniq_current: List[str] = []
+    seen_cur = set()
     for u in product_urls:
-        if u not in seen:
-            seen.add(u); uniq_products.append(u)
+        if u in seen_cur:
+            continue
+        seen_cur.add(u)
+        uniq_current.append(u)
 
-    if not uniq_products:
-        print("[ERROR] 商品URL（shopsId含む）が抽出できませんでした。"); sys.exit(1)
+    # 過去との重複排除
+    new_only: List[str] = [u for u in uniq_current if u not in prev_urls]
+    removed = len(uniq_current) - len(new_only)
+    print(f"[INFO] 今回抽出 {len(uniq_current)} 件 / 過去と重複 {removed} 件 → 新規 {len(new_only)} 件")
 
-    # 3) 商品ページHTML保存 → url_map_*.csv（素状態）作成
-    print(f"[INFO] 商品ページ保存を開始（{len(uniq_products)}件）")
+    if not new_only:
+        print("[WARN] 新規URLがありません。以降のHTML保存・解析はスキップします。")
+        # 何もせず正常終了とする
+        print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（抽出ログのみ更新）")
+        return
+
+    # 3) 商品ページHTML保存 → url_map_*.csv（素状態）作成（★新規URLのみ）
+    print(f"[INFO] 商品ページ保存を開始（新規 {len(new_only)}件）")
     map_rows: List[Dict[str, str]] = []
     saved = failed = 0
 
@@ -598,8 +646,8 @@ def main():
         )
         page = context.new_page()
 
-        for i, url in enumerate(uniq_products, 1):
-            print(f"[PROD {i}/{len(uniq_products)}] GET {url}")
+        for i, url in enumerate(new_only, 1):
+            print(f"[PROD {i}/{len(new_only)}] GET {url}")
             fname = build_html_filename(url, prefix="prod")
             status = "saved"
             ok = False; err: Optional[Exception] = None
@@ -637,10 +685,9 @@ def main():
     print(f"Map   : {OUT_MAP.resolve()}")
     print("========================\n")
 
-    # 4) 解析 → url_map_* に情報付与で上書き（★OUT_CSVは廃止）
+    # 4) 解析 → url_map_* に情報付与で上書き
     print("[INFO] 解析フェーズを開始します")
-    # ★変更: 最終成果は url_map（model列も保持）。旧result.csvは出力しない。
-    RESULT_HEADERS = BASE_HEADERS + ENRICH_HEADERS  # model も保持する方針に変更
+    RESULT_HEADERS = BASE_HEADERS + ENRICH_HEADERS
 
     enriched_rows: List[Dict[str, str]] = []
     proc = skip = 0
@@ -702,7 +749,7 @@ def main():
         append_search_keywords()
     except Exception as e:
         print(f"[WARN] 検索キーワード生成に失敗しました: {e}")
-        # 最低限、検索キーワード列を空で書き出す（★OUT_MAPを読む）
+        # 最低限、検索キーワード列を空で書き出す（OUT_MAPベース）
         try:
             df_tmp = pd.read_csv(OUT_MAP)
             if "search_keyword" not in df_tmp.columns:
