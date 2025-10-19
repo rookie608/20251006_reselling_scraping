@@ -13,6 +13,11 @@
 - output/url_map_YYYYMMDDHHMM.csv              : 商品URL↔HTML対応 + 解析情報（最終成果）
 - output/result_with_まとめ_YYYYMMDDHHMM.csv   : url_map 上に search_keyword 列を付与したもの
 - output/html/*.html                           : 保存した商品ページ（必要に応じて検索ページも）
+
+使い方例：
+  pip install playwright beautifulsoup4 lxml pandas python-dotenv openai
+  playwright install
+  python scrape_secondstreet_pipeline.py --headless
 """
 
 import os, re, csv, json, time, argparse, hashlib, urllib.parse, sys
@@ -116,6 +121,9 @@ def extract_items_from_search(page) -> List[Dict[str, str]]:
     return items
 
 def build_html_filename(url: str, prefix: str = "prod") -> str:
+    """
+    商品ページ用の保存名。prefix='search' を渡せば検索ページにも流用可
+    """
     h = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
     tail = url.split("/")[-1] or "page"
     safe_tail = re.sub(r"[^A-Za-z0-9_-]+", "_", tail)
@@ -171,9 +179,9 @@ def harvest_images(raw_html: str) -> List[str]:
 
     def score(u: str) -> tuple:
         s1 = 1 if "/goods/" in u or "img/pc/goods" in u else 0
+        s4 = 1 if re.search(r"[/_-]1(?:[_.-]|\.jpg|\.jpeg|\.png|\.webp)", u) else 0
         s2 = 1 if "og" in u else 0
         s3 = -len(u)
-        s4 = 1 if re.search(r"[/_-]1(?:[_.-]|\.jpg|\.jpeg|\.png|\.webp)", u) else 0
         return (s1, s4, s2, s3)
 
     normd.sort(key=score, reverse=True)
@@ -481,35 +489,36 @@ def overwrite_url_map_with_enriched(rows: List[Dict[str, str]]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-# ========== ★変更(重複排除): 直近の secondstreet_results_*.csv を探してURL集合を得る ==========
+# ========== 履歴の secondstreet_results_*.csv 全読みで既出URL集合を作る ==========
 RESULTS_NAME_RE = re.compile(r"secondstreet_results_(\d{12})\.csv$", re.IGNORECASE)
-
-def _find_latest_previous_results_path(exclude_path: Path) -> Optional[Path]:
-    """
-    output/secondstreet_results_*.csv から、末尾12桁の日時を見て最新を返す。
-    今回の実行で書いている RESULT_SEARCH_CSV は除外。
-    """
-    cands = []
-    for p in OUT_DIR.glob("secondstreet_results_*.csv"):
-        if p.resolve() == exclude_path.resolve():
-            continue
-        m = RESULTS_NAME_RE.search(p.name)
-        if m:
-            cands.append((m.group(1), p))
-    if not cands:
-        return None
-    # stampが大きい=新しい
-    cands.sort(key=lambda t: t[0], reverse=True)
-    return cands[0][1]
 
 def _read_url_set_from_results(path: Path) -> Set[str]:
     try:
         df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8")
     except Exception:
-        df = pd.read_csv(path, dtype=str, keep_default_na=False)  # encodingフォールバック
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
     if "url" not in df.columns:
         return set()
     return set(str(u) for u in df["url"].dropna().astype(str))
+
+def _read_all_previous_urls(exclude_path: Path) -> Set[str]:
+    """
+    output/secondstreet_results_*.csv を全走査し、今回の出力ファイル exclude_path を除外して
+    すべての既出URLを集合で返す。
+    """
+    all_urls: Set[str] = set()
+    files: List[Path] = []
+    for p in OUT_DIR.glob("secondstreet_results_*.csv"):
+        if p.resolve() == exclude_path.resolve():
+            continue
+        if RESULTS_NAME_RE.search(p.name):
+            files.append(p)
+    if not files:
+        return set()
+    for p in files:
+        all_urls |= _read_url_set_from_results(p)
+    print(f"[INFO] 履歴ファイル {len(files)} 件を集計。既出URL 合計 {len(all_urls)} 件")
+    return all_urls
 
 # ========== ここからメイン処理 ==========
 def main():
@@ -604,14 +613,8 @@ def main():
 
         browser.close()
 
-    # ★変更(重複排除): 前回最新の secondstreet_results_*.csv の URL と比較して、新規のみ残す
-    prev_path = _find_latest_previous_results_path(RESULT_SEARCH_CSV)
-    prev_urls: Set[str] = set()
-    if prev_path:
-        prev_urls = _read_url_set_from_results(prev_path)
-        print(f"[INFO] 直近の結果: {prev_path.name}（URL {len(prev_urls)}件）を読み込み、重複を除外します。")
-    else:
-        print("[INFO] 過去の secondstreet_results_*.csv が見つかりません（初回として全件処理）。")
+    # ★重複排除（全履歴版）: 過去の secondstreet_results_*.csv を全読みして既出URLを集合化
+    prev_urls: Set[str] = _read_all_previous_urls(RESULT_SEARCH_CSV)
 
     # 現在抽出の重複除去（同一URLの二重検出も排除）
     uniq_current: List[str] = []
@@ -622,14 +625,13 @@ def main():
         seen_cur.add(u)
         uniq_current.append(u)
 
-    # 過去との重複排除
+    # 履歴との重複排除 → 新規のみ
     new_only: List[str] = [u for u in uniq_current if u not in prev_urls]
     removed = len(uniq_current) - len(new_only)
-    print(f"[INFO] 今回抽出 {len(uniq_current)} 件 / 過去と重複 {removed} 件 → 新規 {len(new_only)} 件")
+    print(f"[INFO] 今回抽出 {len(uniq_current)} 件 / 履歴と重複 {removed} 件 → 新規 {len(new_only)} 件")
 
     if not new_only:
         print("[WARN] 新規URLがありません。以降のHTML保存・解析はスキップします。")
-        # 何もせず正常終了とする
         print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（抽出ログのみ更新）")
         return
 
@@ -765,7 +767,7 @@ KW_MAX_RETRIES = 5
 KW_RETRY_BASE_WAIT = 2.0  # 秒
 
 KW_SYSTEM_PROMPT = """あなたは中古EC（メルカリ・ラクマ）向けの検索キーワード生成アシスタントです。
-出力は「ブランド名＋型式（型番）」を主軸に、日本語の揺れや英語表記の揺れに強い、短くシンプルな検索語を1行で返してください。
+出力は「ブランド名＋型式（型番）」を主軄に、日本語の揺れや英語表記の揺れに強い、短くシンプルな検索語を1行で返してください。
 
 【出力ルール】
 - 1行のみ。余計な説明や引用符は不要。
@@ -825,6 +827,7 @@ def _generate_keyword(client_obj: "OpenAI", brand: str, product_name: str) -> st
             print(f"[WARN] OpenAI API エラー {e} → {wait:.1f}s 待機 ({attempt}/{KW_MAX_RETRIES})")
             time.sleep(wait)
 
+    # 連続失敗時フォールバック：ブランド単独
     return brand
 
 def append_search_keywords() -> None:
