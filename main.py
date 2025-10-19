@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # scrape_secondstreet_pipeline.py
 # -*- coding: utf-8 -*-
 """
@@ -7,17 +8,23 @@
    → HTMLを解析して output/url_map_YYYYMMDDHHMM.csv へ出力（最終成果はこの1本）
    → （追加）url_map_YYYYMMDDHHMM.csv を読み込み、OpenAIで検索キーワード列 search_keyword を生成して
       output/result_with_まとめ_YYYYMMDDHHMM.csv を出力
+   → （統合）output/result_with_まとめ_*.csv を全連結し重複URL排除。指定のGoogleスプレッドシートに
+      まだ無いURLのみ B〜O（管理番号＋13列）を自動追記（任意：--push-to-sheet）
 
 出力：
 - output/secondstreet_results_YYYYMMDDHHMM.csv : 検索ページ→商品URLの抽出結果（順位つき）
 - output/url_map_YYYYMMDDHHMM.csv              : 商品URL↔HTML対応 + 解析情報（最終成果）
 - output/result_with_まとめ_YYYYMMDDHHMM.csv   : url_map 上に search_keyword 列を付与したもの
 - output/html/*.html                           : 保存した商品ページ（必要に応じて検索ページも）
+- result_merge.csv                              : （統合）result_with_まとめ_* の重複排除連結結果（デバッグ用）
 
 使い方例：
-  pip install playwright beautifulsoup4 lxml pandas python-dotenv openai
+  pip install playwright beautifulsoup4 lxml pandas python-dotenv openai gspread google-auth
   playwright install
-  python scrape_secondstreet_pipeline.py --headless
+  python scrape_secondstreet_pipeline.py --headless --push-to-sheet \
+    --sheet-key 1TCDZ5rDTicA5lWISooKsb4ZyDvXzPiPkI11OgD1cpQI \
+    --sheet-name リサーチシート \
+    --service-account /path/to/service_account.json
 """
 
 import os, re, csv, json, time, argparse, hashlib, urllib.parse, sys
@@ -34,6 +41,16 @@ try:
     from dotenv import load_dotenv  # optional
 except Exception:
     load_dotenv = None  # type: ignore
+
+# =========（スプレッドシート連携 追加）=========
+try:
+    import gspread  # type: ignore
+    from google.oauth2.service_account import Credentials  # type: ignore
+    _GSPREAD_AVAILABLE = True
+except Exception:
+    _GSPREAD_AVAILABLE = False
+    gspread = None  # type: ignore
+    Credentials = None  # type: ignore
 
 # ========== パス ==========
 BASE_DIR = Path(__file__).resolve().parent
@@ -520,254 +537,13 @@ def _read_all_previous_urls(exclude_path: Path) -> Set[str]:
     print(f"[INFO] 履歴ファイル {len(files)} 件を集計。既出URL 合計 {len(all_urls)} 件")
     return all_urls
 
-# ========== ここからメイン処理 ==========
-def main():
-    ap = argparse.ArgumentParser(description="2nd STREET: 検索URL→商品URL抽出→HTML保存→解析（shopsId付き）")
-    ap.add_argument("--headless", action="store_true", help="ブラウザをヘッドレスで実行")
-    ap.add_argument("--overwrite", action="store_true", help="既存HTMLを上書き保存")
-    ap.add_argument("--delay", type=float, default=0.5, help="各リクエスト間待機秒（既定0.5）")
-    ap.add_argument("--retries", type=int, default=2, help="保存失敗時のリトライ回数（既定2）")
-    ap.add_argument("--no-llm", action="store_true", help="LLM抽出を使わず常にBSフォールバックを使用")
-    ap.add_argument("--save-search-html", action="store_true", help="検索ページHTMLも保存する（デフォルトは保存しない）")
-    args = ap.parse_args()
-
-    use_llm = (not args.no_llm) and _USE_LLM
-    if args.no_llm:
-        print("[INFO] --no-llm 指定：BeautifulSoupフォールバックのみで解析します。")
-    elif not _USE_LLM:
-        print("[INFO] OPENAI_API_KEY 未設定：BeautifulSoupフォールバックで解析します。")
-
-    ensure_dirs()
-
-    # 1) input/*.csv 読み込み → 検索ページURLの抽出
-    csv_files = list(INPUT_DIR.glob("*.csv"))
-    if not csv_files:
-        print("[ERROR] inputフォルダにCSVが見つかりません。"); sys.exit(1)
-
-    print(f"[INFO] {len(csv_files)}件のCSVを処理します。")
-    write_search_results_header()
-
-    search_urls: List[Dict[str, Any]] = []  # {src_file, src_row, url}
-    for csv_file in csv_files:
-        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False, encoding="utf-8", engine="python")
-        for idx, row in df.iterrows():
-            urls = find_urls_in_row(row.values)
-            for u in urls:
-                if SEARCH_PAGE_HINT in u:
-                    search_urls.append({"src_file": csv_file.name, "src_row": idx+1, "url": u})
-
-    if not search_urls:
-        print("[ERROR] 検索ページURLが見つかりませんでした（www.2ndstreet.jp/search が0件）。"); sys.exit(1)
-
-    # 2) 検索ページ→商品URL抽出
-    product_urls: List[str] = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=UA, locale="ja-JP", timezone_id="Asia/Tokyo"
-        )
-        page = context.new_page()
-
-        for i, entry in enumerate(search_urls, 1):
-            s_url = entry["url"]
-            print(f"[SEARCH {i}/{len(search_urls)}] {s_url}")
-            try:
-                page.goto(s_url, wait_until="domcontentloaded", timeout=60000)
-            except PWTimeout:
-                print("  [WARN] タイムアウト、続行します。")
-            time.sleep(1.0)
-
-            # （任意）検索ページHTML保存
-            if args.save_search_html:
-                try:
-                    save_html(page, s_url, wait_selector=None, overwrite=args.overwrite, prefix="search")
-                except Exception as e:
-                    print(f"  [WARN] 検索HTML保存失敗: {e}")
-
-            # 商品URL抽出
-            rows_to_write = []
-            try:
-                items = extract_items_from_search(page)
-                print(f"  [INFO] {len(items)}件検出")
-                for rank, it in enumerate(items, start=1):
-                    rows_to_write.append({
-                        "src_file": entry["src_file"],
-                        "src_row": entry["src_row"],
-                        "search_page_url": s_url,
-                        "rank": rank,
-                        "title": it["title"],
-                        "url": it["url"]
-                    })
-                    product_urls.append(it["url"])
-            except Exception as e:
-                print(f"  [ERROR] 抽出失敗: {e}")
-
-            if rows_to_write:
-                append_search_results(rows_to_write)
-
-            if args.delay > 0:
-                time.sleep(args.delay)
-
-        browser.close()
-
-    # ★重複排除（全履歴版）: 過去の secondstreet_results_*.csv を全読みして既出URLを集合化
-    prev_urls: Set[str] = _read_all_previous_urls(RESULT_SEARCH_CSV)
-
-    # 現在抽出の重複除去（同一URLの二重検出も排除）
-    uniq_current: List[str] = []
-    seen_cur = set()
-    for u in product_urls:
-        if u in seen_cur:
-            continue
-        seen_cur.add(u)
-        uniq_current.append(u)
-
-    # 履歴との重複排除 → 新規のみ
-    new_only: List[str] = [u for u in uniq_current if u not in prev_urls]
-    removed = len(uniq_current) - len(new_only)
-    print(f"[INFO] 今回抽出 {len(uniq_current)} 件 / 履歴と重複 {removed} 件 → 新規 {len(new_only)} 件")
-
-    if not new_only:
-        print("[WARN] 新規URLがありません。以降のHTML保存・解析はスキップします。")
-        print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（抽出ログのみ更新）")
-        return
-
-    # 3) 商品ページHTML保存 → url_map_*.csv（素状態）作成（★新規URLのみ）
-    print(f"[INFO] 商品ページ保存を開始（新規 {len(new_only)}件）")
-    map_rows: List[Dict[str, str]] = []
-    saved = failed = 0
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 900},
-            user_agent=UA, locale="ja-JP", timezone_id="Asia/Tokyo"
-        )
-        page = context.new_page()
-
-        for i, url in enumerate(new_only, 1):
-            print(f"[PROD {i}/{len(new_only)}] GET {url}")
-            fname = build_html_filename(url, prefix="prod")
-            status = "saved"
-            ok = False; err: Optional[Exception] = None
-            for attempt in range(args.retries + 1):
-                try:
-                    save_html(page, url, wait_selector="h1", overwrite=args.overwrite, prefix="prod")
-                    ok = True; break
-                except Exception as e:
-                    err = e
-                    print(f"  ↳ attempt {attempt+1} failed: {e}")
-                    time.sleep(1.0)
-            if ok:
-                saved += 1
-            else:
-                failed += 1
-                status = f"fail:{type(err).__name__}" if err else "fail"
-                print(f"[FAIL] {url} : {err}")
-            if args.delay > 0:
-                time.sleep(args.delay)
-
-            map_rows.append({
-                "url": url,
-                "file": fname if ok or (HTML_DIR / fname).exists() else "",
-                "status": status if (ok or status.startswith("fail")) else "skipped",
-                "saved_at": now,
-            })
-
-        browser.close()
-
-    write_url_map(map_rows)
-    print("\n===== SAVE SUMMARY =====")
-    print(f"Saved : {saved}")
-    print(f"Failed: {failed}")
-    print(f"Dir   : {HTML_DIR.resolve()}")
-    print(f"Map   : {OUT_MAP.resolve()}")
-    print("========================\n")
-
-    # 4) 解析 → url_map_* に情報付与で上書き
-    print("[INFO] 解析フェーズを開始します")
-    RESULT_HEADERS = BASE_HEADERS + ENRICH_HEADERS
-
-    enriched_rows: List[Dict[str, str]] = []
-    proc = skip = 0
-    map_rows = read_url_map()
-    total = len(map_rows)
-    if not map_rows:
-        print(f"[WARN] 中間CSVが空です: {OUT_MAP}")
-
-    for i, row in enumerate(map_rows, 1):
-        url = row.get("url", "")
-        fname = row.get("file", "")
-        status = row.get("status", "")
-        base = {k: row.get(k, "") for k in BASE_HEADERS}
-
-        if not fname or status.startswith("fail"):
-            skip += 1
-            print(f"[SKIP] {i}/{total} {url} （fileなし/失敗行）")
-            base.update({k: "" for k in ENRICH_HEADERS})
-            enriched_rows.append(base)
-            continue
-
-        fpath = HTML_DIR / fname
-        if not fpath.exists():
-            skip += 1
-            print(f"[SKIP] {i}/{total} {url} （HTML未存在: {fname}）")
-            base.update({k: "" for k in ENRICH_HEADERS})
-            enriched_rows.append(base)
-            continue
-
-        try:
-            data = process_file(fpath, use_llm=use_llm)
-            proc += 1
-            base.update({
-                "image": (data.get("images") or [""])[0],
-                "product_name": data.get("product_name", ""),
-                "brand": data.get("brand", ""),
-                "model": data.get("model", ""),
-                "categories": " > ".join(data.get("categories", [])),
-                "condition": data.get("condition", ""),
-                "price": data.get("price", ""),
-                "shipping_fee": data.get("shipping_fee", ""),
-            })
-            enriched_rows.append(base)
-            print(f"[OK] {i}/{total} {fname}")
-            time.sleep(0.2)
-        except Exception as e:
-            print(f"[ERROR] {fname}: {e}")
-            base.update({k: "" for k in ENRICH_HEADERS})
-            enriched_rows.append(base)
-
-    overwrite_url_map_with_enriched(enriched_rows)
-
-    print(f"\n[✅ 完了] 解析 {proc} 件 / スキップ {skip} 件")
-    print(f"[WRITE] {OUT_MAP.resolve()}（商品情報 付与済）")
-    print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（検索→商品URL 抽出ログ）")
-
-    # 5) （追加）検索キーワード生成 → result_with_まとめ_*.csv
-    try:
-        append_search_keywords()
-    except Exception as e:
-        print(f"[WARN] 検索キーワード生成に失敗しました: {e}")
-        # 最低限、検索キーワード列を空で書き出す（OUT_MAPベース）
-        try:
-            df_tmp = pd.read_csv(OUT_MAP)
-            if "search_keyword" not in df_tmp.columns:
-                df_tmp["search_keyword"] = ""
-            df_tmp.to_csv(OUT_CSV_KW, index=False, encoding="utf-8-sig")
-            print(f"[INFO] フォールバック出力: {OUT_CSV_KW.resolve()}")
-        except Exception as e2:
-            print(f"[ERROR] フォールバック出力も失敗: {e2}")
-
 # ======== （追加）検索キーワード生成ロジック ========
 KW_MODEL = "gpt-4.1-mini"
 KW_MAX_RETRIES = 5
 KW_RETRY_BASE_WAIT = 2.0  # 秒
 
 KW_SYSTEM_PROMPT = """あなたは中古EC（メルカリ・ラクマ）向けの検索キーワード生成アシスタントです。
-出力は「ブランド名＋型式（型番）」を主軄に、日本語の揺れや英語表記の揺れに強い、短くシンプルな検索語を1行で返してください。
+出力は「ブランド名＋型式（型番）」を主軸に、日本語の揺れや英語表記の揺れに強い、短くシンプルな検索語を1行で返してください。
 
 【出力ルール】
 - 1行のみ。余計な説明や引用符は不要。
@@ -864,6 +640,468 @@ def append_search_keywords() -> None:
     df["search_keyword"] = keywords
     df.to_csv(OUT_CSV_KW, index=False, encoding="utf-8-sig")
     print(f"[✅ 完了] キーワード付き出力: {OUT_CSV_KW.resolve()}")
+
+# ======== （統合）スプレッドシート連携：コードBを関数化して組み込み ========
+
+# 既定値（オプション未指定時に使用）
+DEFAULT_SPREADSHEET_KEY = "1TCDZ5rDTicA5lWISooKsb4ZyDvXzPiPkI11OgD1cpQI"
+DEFAULT_SHEET_NAME = "リサーチシート"
+
+WRITE_START_COL = "B"  # ← B列から書く（管理番号含む）
+WRITE_END_COL   = "O"  # ← B〜O で14列（管理番号+13列）
+
+TARGET_HEADERS: List[str] = [
+    "管理番号",  # B列
+    "url",
+    "file",
+    "status",
+    "saved_at",
+    "image",
+    "product_name",
+    "brand",
+    "model",
+    "categories",
+    "condition",
+    "price",
+    "shipping_fee",
+    "search_keyword",
+]
+
+ALIASES: Dict[str, List[str]] = {
+    "url": ["URL", "Url"],
+    "file": ["input_file", "prod_file", "file_path", "file_name"],
+    "status": ["state"],
+    "saved_at": ["saved", "savedAt", "created_at", "timestamp", "scraped_at"],
+    "image": ["image_url", "img", "thumbnail", "thumb"],
+    "product_name": ["title", "name", "product"],
+    "brand": ["maker", "manufacturer"],
+    "model": ["model_name", "code", "型番"],
+    "categories": ["category", "cat"],
+    "condition": ["item_condition", "rank", "grade"],
+    "price": ["amount", "price_jpy", "price_yen"],
+    "shipping_fee": ["shipping", "postage", "delivery_fee", "shipping_cost"],
+    "search_keyword": ["keyword", "search_key", "searchword"],
+}
+
+def col_to_index(letter: str) -> int:
+    letter = letter.upper()
+    num = 0
+    for ch in letter:
+        num = num * 26 + (ord(ch) - ord('A') + 1)
+    return num
+
+def _gs_get_credentials(service_account_json: Path) -> "Credentials":
+    if not _GSPREAD_AVAILABLE:
+        raise RuntimeError("gspread / google-auth がインストールされていません。pip install gspread google-auth")
+    if not service_account_json.exists():
+        raise FileNotFoundError(f"service_account.json が見つかりません: {service_account_json}")
+    return Credentials.from_service_account_file(str(service_account_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+
+def find_first_empty_row_in_col(ws: "gspread.Worksheet", col_letter: str, header_rows: int = 2) -> int:
+    col_idx = col_to_index(col_letter)
+    values = ws.col_values(col_idx)
+    start_row = header_rows + 1
+    for i in range(start_row, len(values) + 1):
+        if values[i - 1] == "":
+            return i
+    return max(len(values) + 1, start_row)
+
+def resolve_column_name(df: pd.DataFrame, target: str) -> Optional[str]:
+    if target in df.columns:
+        return target
+    for c in df.columns:
+        if c.lower() == target.lower():
+            return c
+    for alias in ALIASES.get(target, []):
+        for c in df.columns:
+            if c.lower() == alias.lower():
+                return c
+    return None
+
+def merge_result_csvs(output_dir: Path) -> pd.DataFrame:
+    files = sorted(output_dir.glob("result_with_まとめ_*.csv"))
+    if not files:
+        raise FileNotFoundError("output/ に result_with_まとめ_*.csv が見つかりません。")
+    dfs = []
+    for fp in files:
+        try:
+            df = pd.read_csv(fp)
+        except UnicodeDecodeError:
+            df = pd.read_csv(fp, encoding="utf-8-sig")
+        dfs.append(df)
+    merged = pd.concat(dfs, ignore_index=True)
+
+    url_col = resolve_column_name(merged, "url")
+    if url_col is None:
+        raise KeyError("CSVに 'url' 列が見つかりません。")
+    if url_col != "url":
+        merged = merged.rename(columns={url_col: "url"})
+    merged = merged.dropna(subset=["url"]).copy()
+    merged["url"] = merged["url"].astype(str).str.strip()
+    merged = merged.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
+    return merged
+
+def read_sheet_as_df(ws: "gspread.Worksheet") -> pd.DataFrame:
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    if len(values) == 1:
+        return pd.DataFrame(columns=values[0])
+    header = values[1]   # 2行目が見出し（「2行ヘッダー想定」）
+    body = values[2:]
+    return pd.DataFrame(body, columns=header)
+
+def coerce_numeric_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            def _to_number(x):
+                if x is None:
+                    return ""
+                s = str(x).replace(",", "")
+                s = re.sub(r"[^\d\.\-]", "", s)
+                if s in ("", "-", ".", "-.", ".-"):
+                    return ""
+                try:
+                    f = float(s)
+                    return int(f) if f.is_integer() else f
+                except ValueError:
+                    return ""
+            df[c] = df[c].apply(_to_number)
+    return df
+
+def get_next_ids(last_id: str, count: int) -> List[str]:
+    """例: 'LC0579' -> ['LC0580','LC0581',...]"""
+    m_prefix = re.match(r"[A-Za-z]+", last_id) if last_id else None
+    prefix = m_prefix.group(0) if m_prefix else "LC"
+    num_part = re.search(r"\d+", last_id) if last_id else None
+    start_num = int(num_part.group(0)) if num_part else 0
+    width = len(num_part.group(0)) if num_part else 4
+    return [f"{prefix}{str(start_num + i + 1).zfill(width)}" for i in range(count)]
+
+def push_to_google_sheet(
+    spreadsheet_key: str,
+    sheet_name: str,
+    service_account_json: Path,
+    header_rows: int = 2
+) -> None:
+    """
+    output/result_with_まとめ_*.csv を連結→重複URL排除し、指定シートに存在しないURLのみ B〜O で追記。
+    """
+    root = BASE_DIR
+    output_dir = OUT_DIR
+
+    # 1) CSV マージ
+    df1 = merge_result_csvs(output_dir)
+    (root / "result_merge.csv").write_text(df1.to_csv(index=False), encoding="utf-8")
+    print(f"[INFO] CSVマージ完了: result_merge.csv（{len(df1)} 行）")
+
+    # 2) シート接続
+    creds = _gs_get_credentials(service_account_json)
+    gc = gspread.authorize(creds)
+    ws = gc.open_by_key(spreadsheet_key).worksheet(sheet_name)
+    df2 = read_sheet_as_df(ws)
+
+    # 3) 新規URL抽出
+    df2_urls = df2["url"].astype(str).str.strip().tolist() if "url" in df2.columns else []
+    mask_new = ~df1["url"].astype(str).str.strip().isin(df2_urls)
+    df_new = df1.loc[mask_new].reset_index(drop=True)
+    print(f"[INFO] 新規URL 行数: {len(df_new)}")
+    if df_new.empty:
+        print("[INFO] 追加なし。スプレッドシート更新はスキップします。")
+        return
+
+    # 4) 数値列整形
+    df_new = coerce_numeric_columns(df_new, ["price", "shipping_fee"])
+
+    # 5) B列の管理番号を生成（下端の最後の非空セルを拾う）
+    b_values = ws.col_values(col_to_index("B"))
+    last_id = next((v for v in reversed(b_values) if v.strip()), "LC0000")
+    new_ids = get_next_ids(last_id, len(df_new))
+    print(f"[INFO] 管理番号: {last_id} → {new_ids[0]}〜")
+
+    # 6) 書き込みデータ組成（B〜O固定）
+    write_df = pd.DataFrame()
+    write_df["管理番号"] = new_ids
+    for h in TARGET_HEADERS[1:]:
+        src_col = resolve_column_name(df_new, h)
+        write_df[h] = df_new[src_col] if src_col else ""
+
+    # 7) 書き込み範囲算出（C列で最初の空行を起点）
+    start_row = find_first_empty_row_in_col(ws, "C", header_rows=header_rows)
+    end_row   = start_row + len(write_df) - 1
+    range_name = f"{WRITE_START_COL}{start_row}:{WRITE_END_COL}{end_row}"
+
+    # 8) 貼り付け（USER_ENTERED）
+    values_2d = write_df.fillna("").astype(str).values.tolist()
+    ws.update(range_name, values_2d, value_input_option="USER_ENTERED")
+
+    print(f"[INFO] 貼り付け完了: {len(values_2d)} 行（範囲: {range_name}）")
+
+# ========== ここからメイン処理 ==========
+def main():
+    ap = argparse.ArgumentParser(description="2nd STREET: 検索URL→商品URL抽出→HTML保存→解析→（任意）GS追記")
+    ap.add_argument("--headless", action="store_true", help="ブラウザをヘッドレスで実行")
+    ap.add_argument("--overwrite", action="store_true", help="既存HTMLを上書き保存")
+    ap.add_argument("--delay", type=float, default=0.5, help="各リクエスト間待機秒（既定0.5）")
+    ap.add_argument("--retries", type=int, default=2, help="保存失敗時のリトライ回数（既定2）")
+    ap.add_argument("--no-llm", action="store_true", help="LLM抽出を使わず常にBSフォールバックを使用")
+    ap.add_argument("--save-search-html", action="store_true", help="検索ページHTMLも保存する（デフォルトは保存しない）")
+
+    # （統合）スプレッドシート連携オプション
+    ap.add_argument("--push-to-sheet", action="store_true", help="連結→重複排除→新規のみスプレッドシートに追記")
+    ap.add_argument("--sheet-key", type=str, default=DEFAULT_SPREADSHEET_KEY, help="スプレッドシートのキー（ID）")
+    ap.add_argument("--sheet-name", type=str, default=DEFAULT_SHEET_NAME, help="シート名")
+    ap.add_argument("--service-account", type=str, default="service_account.json", help="service_account.json のパス")
+    ap.add_argument("--header-rows", type=int, default=2, help="ヘッダー行数（既定=2行ヘッダー）")
+
+    args = ap.parse_args()
+
+    use_llm = (not args.no_llm) and _USE_LLM
+    if args.no_llm:
+        print("[INFO] --no-llm 指定：BeautifulSoupフォールバックのみで解析します。")
+    elif not _USE_LLM:
+        print("[INFO] OPENAI_API_KEY 未設定：BeautifulSoupフォールバックで解析します。")
+
+    if args.push_to_sheet and not _GSPREAD_AVAILABLE:
+        print("[ERROR] --push-to-sheet 指定ですが gspread / google-auth がインストールされていません。")
+        sys.exit(2)
+
+    ensure_dirs()
+
+    # 1) input/*.csv 読み込み → 検索ページURLの抽出
+    csv_files = list(INPUT_DIR.glob("*.csv"))
+    if not csv_files:
+        print("[ERROR] inputフォルダにCSVが見つかりません。"); sys.exit(1)
+
+    print(f"[INFO] {len(csv_files)}件のCSVを処理します。")
+    write_search_results_header()
+
+    search_urls: List[Dict[str, Any]] = []  # {src_file, src_row, url}
+    for csv_file in csv_files:
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False, encoding="utf-8", engine="python")
+        for idx, row in df.iterrows():
+            urls = find_urls_in_row(row.values)
+            for u in urls:
+                if SEARCH_PAGE_HINT in u:
+                    search_urls.append({"src_file": csv_file.name, "src_row": idx+1, "url": u})
+
+    if not search_urls:
+        print("[ERROR] 検索ページURLが見つかりませんでした（www.2ndstreet.jp/search が0件）。"); sys.exit(1)
+
+    # 2) 検索ページ→商品URL抽出
+    product_urls: List[str] = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=args.headless)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=UA, locale="ja-JP", timezone_id="Asia/Tokyo"
+        )
+        page = context.new_page()
+
+        for i, entry in enumerate(search_urls, 1):
+            s_url = entry["url"]
+            print(f"[SEARCH {i}/{len(search_urls)}] {s_url}")
+            try:
+                page.goto(s_url, wait_until="domcontentloaded", timeout=60000)
+            except PWTimeout:
+                print("  [WARN] タイムアウト、続行します。")
+            time.sleep(1.0)
+
+            # （任意）検索ページHTML保存
+            if args.save_search_html:
+                try:
+                    save_html(page, s_url, wait_selector=None, overwrite=args.overwrite, prefix="search")
+                except Exception as e:
+                    print(f"  [WARN] 検索HTML保存失敗: {e}")
+
+            # 商品URL抽出
+            rows_to_write = []
+            try:
+                items = extract_items_from_search(page)
+                print(f"  [INFO] {len(items)}件検出")
+                for rank, it in enumerate(items, start=1):
+                    rows_to_write.append({
+                        "src_file": entry["src_file"],
+                        "src_row": entry["src_row"],
+                        "search_page_url": s_url,
+                        "rank": rank,
+                        "title": it["title"],
+                        "url": it["url"]
+                    })
+                    product_urls.append(it["url"])
+            except Exception as e:
+                print(f"  [ERROR] 抽出失敗: {e}")
+
+            if rows_to_write:
+                append_search_results(rows_to_write)
+
+            if args.delay > 0:
+                time.sleep(args.delay)
+
+        browser.close()
+
+    # ★重複排除（全履歴版）: 過去の secondstreet_results_*.csv を全読みして既出URLを集合化
+    prev_urls: Set[str] = _read_all_previous_urls(RESULT_SEARCH_CSV)
+
+    # 現在抽出の重複除去（同一URLの二重検出も排除）
+    uniq_current: List[str] = []
+    seen_cur = set()
+    for u in product_urls:
+        if u in seen_cur:
+            continue
+        seen_cur.add(u)
+        uniq_current.append(u)
+
+    # 履歴との重複排除 → 新規のみ
+    new_only: List[str] = [u for u in uniq_current if u not in prev_urls]
+    removed = len(uniq_current) - len(new_only)
+    print(f"[INFO] 今回抽出 {len(uniq_current)} 件 / 履歴と重複 {removed} 件 → 新規 {len(new_only)} 件")
+
+    if not new_only:
+        print("[WARN] 新規URLがありません。HTML保存・解析はスキップします。")
+        print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（抽出ログのみ更新）")
+        # ★ここで return しない：--push-to-sheet 指定時は過去CSVからでもGS追記を進める
+
+    # 3) 商品ページHTML保存 → url_map_*.csv（素状態）作成（★新規URLのみ）
+    print(f"[INFO] 商品ページ保存を開始（新規 {len(new_only)}件）")
+    map_rows: List[Dict[str, str]] = []
+    saved = failed = 0
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=args.headless)
+        context = browser.new_context(
+            viewport={"width": 1366, "height": 900},
+            user_agent=UA, locale="ja-JP", timezone_id="Asia/Tokyo"
+        )
+        page = context.new_page()
+
+        for i, url in enumerate(new_only, 1):
+            print(f"[PROD {i}/{len(new_only)}] GET {url}")
+            fname = build_html_filename(url, prefix="prod")
+            status = "saved"
+            ok = False; err: Optional[Exception] = None
+            for attempt in range(args.retries + 1):
+                try:
+                    save_html(page, url, wait_selector="h1", overwrite=args.overwrite, prefix="prod")
+                    ok = True; break
+                except Exception as e:
+                    err = e
+                    print(f"  ↳ attempt {attempt+1} failed: {e}")
+                    time.sleep(1.0)
+            if ok:
+                saved += 1
+            else:
+                failed += 1
+                status = f"fail:{type(err).__name__}" if err else "fail"
+                print(f"[FAIL] {url} : {err}")
+            if args.delay > 0:
+                time.sleep(args.delay)
+
+            map_rows.append({
+                "url": url,
+                "file": fname if ok or (HTML_DIR / fname).exists() else "",
+                "status": status if (ok or status.startswith("fail")) else "skipped",
+                "saved_at": now,
+            })
+
+        browser.close()
+
+    write_url_map(map_rows)
+    print("\n===== SAVE SUMMARY =====")
+    print(f"Saved : {saved}")
+    print(f"Failed: {failed}")
+    print(f"Dir   : {HTML_DIR.resolve()}")
+    print(f"Map   : {OUT_MAP.resolve()}")
+    print("========================\n")
+
+    # 4) 解析 → url_map_* に情報付与で上書き
+    print("[INFO] 解析フェーズを開始します")
+    enriched_rows: List[Dict[str, str]] = []
+    proc = skip = 0
+    map_rows = read_url_map()
+    total = len(map_rows)
+    if not map_rows:
+        print(f"[WARN] 中間CSVが空です: {OUT_MAP}")
+
+    for i, row in enumerate(map_rows, 1):
+        url = row.get("url", "")
+        fname = row.get("file", "")
+        status = row.get("status", "")
+        base = {k: row.get(k, "") for k in BASE_HEADERS}
+
+        if not fname or status.startswith("fail"):
+            skip += 1
+            print(f"[SKIP] {i}/{total} {url} （fileなし/失敗行）")
+            base.update({k: "" for k in ENRICH_HEADERS})
+            enriched_rows.append(base)
+            continue
+
+        fpath = HTML_DIR / fname
+        if not fpath.exists():
+            skip += 1
+            print(f"[SKIP] {i}/{total} {url} （HTML未存在: {fname}）")
+            base.update({k: "" for k in ENRICH_HEADERS})
+            enriched_rows.append(base)
+            continue
+
+        try:
+            data = process_file(fpath, use_llm=use_llm)
+            proc += 1
+            base.update({
+                "image": (data.get("images") or [""])[0],
+                "product_name": data.get("product_name", ""),
+                "brand": data.get("brand", ""),
+                "model": data.get("model", ""),
+                "categories": " > ".join(data.get("categories", [])),
+                "condition": data.get("condition", ""),
+                "price": data.get("price", ""),
+                "shipping_fee": data.get("shipping_fee", ""),
+            })
+            enriched_rows.append(base)
+            print(f"[OK] {i}/{total} {fname}")
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"[ERROR] {fname}: {e}")
+            base.update({k: "" for k in ENRICH_HEADERS})
+            enriched_rows.append(base)
+
+    overwrite_url_map_with_enriched(enriched_rows)
+
+    print(f"\n[✅ 完了] 解析 {proc} 件 / スキップ {skip} 件")
+    print(f"[WRITE] {OUT_MAP.resolve()}（商品情報 付与済）")
+    print(f"[WRITE] {RESULT_SEARCH_CSV.resolve()}（検索→商品URL 抽出ログ）")
+
+    # 5) 検索キーワード生成 → result_with_まとめ_*.csv
+    try:
+        append_search_keywords()
+    except Exception as e:
+        print(f"[WARN] 検索キーワード生成に失敗しました: {e}")
+        # 最低限、検索キーワード列を空で書き出す（OUT_MAPベース）
+        try:
+            df_tmp = pd.read_csv(OUT_MAP)
+            if "search_keyword" not in df_tmp.columns:
+                df_tmp["search_keyword"] = ""
+            df_tmp.to_csv(OUT_CSV_KW, index=False, encoding="utf-8-sig")
+            print(f"[INFO] フォールバック出力: {OUT_CSV_KW.resolve()}")
+        except Exception as e2:
+            print(f"[ERROR] フォールバック出力も失敗: {e2}")
+
+    # 6) （統合）スプレッドシート連携
+    if args.push_to_sheet:
+        try:
+            service_json = Path(args.service_account).expanduser().resolve()
+            push_to_google_sheet(
+                spreadsheet_key=args.sheet_key,
+                sheet_name=args.sheet_name,
+                service_account_json=service_json,
+                header_rows=args.header_rows
+            )
+        except Exception as e:
+            print(f"[ERROR] スプレッドシート連携に失敗しました: {e}")
+            sys.exit(3)
 
 if __name__ == "__main__":
     main()
