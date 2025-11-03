@@ -150,7 +150,12 @@ def main():
         ax.scatter(
             x=np.arange(len(order)),
             y=means.values,
-            s=70, marker="D", color="red", zorder=5, label="Mean"
+            s=70,
+            marker="D",
+            color="black",
+            alpha=0.5,  # ← ここを追加（0.0 = 完全透明, 1.0 = 不透明）
+            zorder=5,
+            label="Mean"
         )
 
         ax.set_xlabel("Brand")
