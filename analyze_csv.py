@@ -7,6 +7,7 @@ input_analysis 内のCSVをまとめて読み込み、前処理後に2種類の�
 Outputs:
 - output_analysis/scatter_status_vs_price.png
 - output_analysis/box_status_vs_brand.png
+- output_analysis/processed_data.csv
 """
 from __future__ import annotations
 
@@ -15,6 +16,23 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib import rcParams, font_manager
+
+# ---------- Font (Japanese-safe) ----------
+def enable_japanese_font(verbose: bool = True) -> None:
+    """日本語グリフを含むフォントを優先指定し、豆腐(□)化を防ぐ。"""
+    candidates = [
+        "Hiragino Sans", "Hiragino Kaku Gothic ProN",  # macOS
+        "Yu Gothic", "Meiryo",                        # Windows
+        "Noto Sans CJK JP", "Noto Sans JP", "IPAexGothic", "TakaoGothic"  # OSS
+    ]
+    installed = {f.name for f in font_manager.fontManager.ttflist}
+    chosen = next((n for n in candidates if n in installed), None)
+    rcParams["font.family"] = "sans-serif"
+    rcParams["font.sans-serif"] = candidates
+    rcParams["axes.unicode_minus"] = False
+    if verbose:
+        print(f"[INFO] Japanese font chosen: {chosen or 'fallback from list'}")
 
 # ---------- Utility ----------
 def load_csvs_from_input_folder(folder: str = "input_analysis", header_row: int = 1) -> pd.DataFrame:
@@ -22,7 +40,6 @@ def load_csvs_from_input_folder(folder: str = "input_analysis", header_row: int 
     files = sorted(p.glob("*.csv"))
     if not files:
         raise FileNotFoundError(f"{folder} にCSVファイルが見つかりません。")
-
     dfs = []
     for f in files:
         try:
@@ -39,11 +56,9 @@ def load_csvs_from_input_folder(folder: str = "input_analysis", header_row: int 
                 raise
         df["__source_file"] = f.name
         dfs.append(df)
-
     cat = pd.concat(dfs, ignore_index=True)
     cat.columns = [str(c).strip() for c in cat.columns]
     return cat
-
 
 def to_numeric_clean(s: pd.Series) -> pd.Series:
     return (
@@ -53,7 +68,6 @@ def to_numeric_clean(s: pd.Series) -> pd.Series:
         .replace({"nan": None, "": None})
         .astype(float)
     )
-
 
 def find_price_column(columns: list[str]) -> str | None:
     for c in columns:
@@ -66,10 +80,8 @@ def find_price_column(columns: list[str]) -> str | None:
 
 # ---------- Main ----------
 def main():
-    # 見た目（Seabornテーマ）
     sns.set_theme(style="whitegrid", context="talk")
-    # 日本語を使う場合はフォント指定を有効化（英語のみなら不要）
-    # plt.rcParams["font.family"] = "IPAexGothic"  # Mac: 'Hiragino Sans', Win: 'MS Gothic' など
+    enable_japanese_font(verbose=True)
 
     df = load_csvs_from_input_folder()
 
@@ -84,42 +96,46 @@ def main():
     # 前処理
     df = df[df["作業者"].astype(str).str.strip().ne("")]
     df["__status_num"] = (
-            pd.to_numeric(
-                df["利益割合"]
-                .astype(str)
-                .str.strip()
-                .str.replace(",", "", regex=False)  # 1,234.56 → 1234.56
-                .str.replace("%", "", regex=False),  # 12.3% → 12.3
-                errors="coerce"
-            )
-            .where(df["利益割合"].astype(str) != "#DIV/0!", np.nan)  # #DIV/0! を NaN
+        pd.to_numeric(
+            df["利益割合"]
+              .astype(str)
+              .str.strip()
+              .str.replace(",", "", regex=False)
+              .str.replace("%", "", regex=False),
+            errors="coerce"
+        )
+        .where(df["利益割合"].astype(str) != "#DIV/0!", np.nan)
     )
+
     exclude_conditions = ["中古C", "ジャンク", "Broken"]
-    df = df[~df["condition"].isin(exclude_conditions)].copy()
+    if "condition" in df.columns:
+        df = df[~df["condition"].isin(exclude_conditions)].copy()
+
     df = df[df["__status_num"] != -100]
     df["__price_num"] = to_numeric_clean(df[price_col])
 
-    # 出力先
+    # 出力先フォルダ
     out = Path("output_analysis")
     out.mkdir(exist_ok=True)
+
+    # ---------- CSV保存 ----------
+    csv_path = out / "processed_data.csv"
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"[INFO] Saved cleaned dataframe → {csv_path}")
 
     # ---------- 1) Scatter: Price vs Status ----------
     plot_df = df.dropna(subset=["__status_num", "__price_num"])
     fig, ax = plt.subplots(figsize=(7.5, 5.2))
-    sns.scatterplot(
-        data=plot_df,
-        x="__price_num", y="__status_num",
-        alpha=0.7, edgecolor=None, ax=ax
-    )
+    sns.scatterplot(data=plot_df, x="__price_num", y="__status_num", alpha=0.7, edgecolor=None, ax=ax)
     ax.set_xlabel("Price")
     ax.set_ylabel("Status (%)")
     ax.set_title("Status vs Price")
     sns.despine()
     fig.tight_layout()
-    fig.savefig(out / "scatter_status_vs_price.png", dpi=150)
+    fig.savefig(out / "scatter_status_vs_price.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    # ---------- 2) Box + Points: Brand vs Status (mean-sorted) ----------
+    # ---------- 2) Box + Points: Brand vs Status ----------
     brand_col = None
     for cand in ("brand", "Brand", "ブランド", "メーカー"):
         if cand in df.columns:
@@ -128,7 +144,6 @@ def main():
 
     if brand_col:
         bdf = df.dropna(subset=["__status_num", brand_col]).copy()
-        # 並べ替え順（平均の降順）
         order = (
             bdf.groupby(brand_col)["__status_num"]
             .mean()
@@ -137,38 +152,14 @@ def main():
         )
 
         fig, ax = plt.subplots(figsize=(11, 6.5))
-        # 箱ひげ図（外れ値マーカーは控えめに）
-        sns.boxplot(
-            data=bdf, x=brand_col, y="__status_num",
-            order=order,
-            color="lightgray",
-            width=0.6,
-            fliersize=2,
-            linewidth=1.2,
-            ax=ax
-        )
-        # 個別点を重ねる（横に微 jitter）
-        # サンプル数がとても多い場合は dodge=False の stripplot が安全
-        sns.stripplot(
-            data=bdf, x=brand_col, y="__status_num",
-            order=order,
-            alpha=0.55, size=3.5, jitter=0.25,
-            edgecolor="gray", linewidth=0.3,
-            ax=ax
-        )
+        sns.boxplot(data=bdf, x=brand_col, y="__status_num", order=order,
+                    color="lightgray", width=0.6, fliersize=2, linewidth=1.2, ax=ax)
+        sns.stripplot(data=bdf, x=brand_col, y="__status_num", order=order,
+                      alpha=0.55, size=3.5, jitter=0.25, edgecolor="gray", linewidth=0.3, ax=ax)
 
-        # 平均値の赤い点も重ねる（視認性UP）
         means = bdf.groupby(brand_col)["__status_num"].mean().reindex(order)
-        ax.scatter(
-            x=np.arange(len(order)),
-            y=means.values,
-            s=70,
-            marker="D",
-            color="black",
-            alpha=0.5,  # ← ここを追加（0.0 = 完全透明, 1.0 = 不透明）
-            zorder=5,
-            label="Mean"
-        )
+        ax.scatter(x=np.arange(len(order)), y=means.values, s=70, marker="D",
+                   color="black", alpha=0.5, zorder=5, label="Mean")
 
         ax.set_xlabel("Brand")
         ax.set_ylabel("Status (%)")
@@ -177,7 +168,7 @@ def main():
         plt.setp(ax.get_xticklabels(), rotation=90, ha="right", fontsize=6)
         sns.despine()
         fig.tight_layout()
-        fig.savefig(out / "box_status_vs_brand.png", dpi=150)
+        fig.savefig(out / "box_status_vs_brand.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
     else:
         print("[WARN] 'brand' or 'ブランド' column not found. Boxplot skipped.")
