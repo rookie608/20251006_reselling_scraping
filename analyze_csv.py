@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-input_analysis 内のCSVをまとめて読み込み、前処理後に2種類の図を保存:
+input_analysis 内のCSVをまとめて読み込み、前処理後に3種類の図を保存:
 1) Scatter: Price vs Status
 2) Box + Points: Brand vs Status (sorted by mean, seaborn style)
+3) Box + Points: Price(¥1,000 bins) vs Status + bin means
 
 Outputs:
 - output_analysis/scatter_status_vs_price.png
 - output_analysis/box_status_vs_brand.png
+- output_analysis/box_status_vs_price_bins.png
 - output_analysis/processed_data.csv
 """
 from __future__ import annotations
@@ -173,8 +175,69 @@ def main():
     else:
         print("[WARN] 'brand' or 'ブランド' column not found. Boxplot skipped.")
 
-    print("[INFO] Saved: scatter_status_vs_price.png, box_status_vs_brand.png")
+    # ---------- 3) Box + Points: Price(¥1,000 bins) vs Status + bin means ----------
+    # 価格を¥1,000刻みの区間にビニング（[下限, 上限)の半開区間。例: 6500 → 6000–7000）
+    bdf2 = df.dropna(subset=["__status_num", "__price_num"]).copy()
+    if not bdf2.empty:
+        p_min = float(np.nanmin(bdf2["__price_num"]))
+        p_max = float(np.nanmax(bdf2["__price_num"]))
+        start = int(np.floor(p_min / 1000.0) * 1000)
+        end   = int(np.ceil (p_max / 1000.0) * 1000)
+        edges = np.arange(start, end + 1000, 1000, dtype=int)
+        if len(edges) >= 2:
+            labels = [f"{lo}–{lo+1000}" for lo in edges[:-1]]
+            bdf2["price_bin"] = pd.cut(
+                bdf2["__price_num"],
+                bins=edges,
+                labels=labels,
+                right=False,          # 上限は含まない: [6000,7000)
+                include_lowest=True
+            )
 
+            bdf2 = bdf2.dropna(subset=["price_bin"])
+            order_bins = labels  # 軸の並びを下限→上限の順に固定
+
+            fig, ax = plt.subplots(figsize=(12, 6.5))
+            # ボックスプロット
+            sns.boxplot(
+                data=bdf2, x="price_bin", y="__status_num",
+                order=order_bins, color="lightgray",
+                width=0.6, fliersize=2, linewidth=1.2, ax=ax
+            )
+            # 各点を重ねる（軽くジッター）
+            sns.stripplot(
+                data=bdf2, x="price_bin", y="__status_num",
+                order=order_bins, alpha=0.55, size=3.5,
+                jitter=0.25, edgecolor="gray", linewidth=0.3, ax=ax
+            )
+            # 各区間の平均を重ねる
+            # 各区間の中央値を重ねる
+            bin_medians = (
+                bdf2.groupby("price_bin")["__status_num"]
+                .median()
+                .reindex(order_bins)
+            )
+            ax.scatter(
+                x=np.arange(len(order_bins)),
+                y=bin_medians.values,
+                s=70, marker="D", color="black", alpha=0.7, zorder=5, label="Median"
+            )
+
+            ax.set_xlabel("Price (¥1,000 bins)")
+            ax.set_ylabel("Status (%)")
+            ax.set_title("Status Distribution by Price (¥1,000 bins)")
+            ax.legend(frameon=False, loc="upper right")
+            plt.setp(ax.get_xticklabels(), rotation=90, ha="right", fontsize=7)
+            sns.despine()
+            fig.tight_layout()
+            fig.savefig(out / "box_status_vs_price_bins.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+        else:
+            print("[WARN] Not enough price range to create ¥1,000 bins. Skipped price-bin boxplot.")
+    else:
+        print("[WARN] No valid rows for price/status. Skipped price-bin boxplot.")
+
+    print("[INFO] Saved: scatter_status_vs_price.png, box_status_vs_brand.png, box_status_vs_price_bins.png")
 
 if __name__ == "__main__":
     main()
