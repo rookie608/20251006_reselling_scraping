@@ -74,8 +74,8 @@ def main():
     df = load_csvs_from_input_folder()
 
     # 必須列チェック
-    if "作業者" not in df.columns or "ステータス" not in df.columns:
-        raise ValueError("CSVに '作業者' または 'ステータス' 列がありません。")
+    if "作業者" not in df.columns or "利益割合" not in df.columns:
+        raise ValueError("CSVに '作業者' または '利益割合' 列がありません。")
 
     price_col = find_price_column(list(df.columns))
     if not price_col:
@@ -83,7 +83,19 @@ def main():
 
     # 前処理
     df = df[df["作業者"].astype(str).str.strip().ne("")]
-    df["__status_num"] = to_numeric_clean(df["ステータス"])
+    df["__status_num"] = (
+            pd.to_numeric(
+                df["利益割合"]
+                .astype(str)
+                .str.strip()
+                .str.replace(",", "", regex=False)  # 1,234.56 → 1234.56
+                .str.replace("%", "", regex=False),  # 12.3% → 12.3
+                errors="coerce"
+            )
+            .where(df["利益割合"].astype(str) != "#DIV/0!", np.nan)  # #DIV/0! を NaN
+    )
+    exclude_conditions = ["中古C", "ジャンク", "Broken"]
+    df = df[~df["condition"].isin(exclude_conditions)].copy()
     df = df[df["__status_num"] != -100]
     df["__price_num"] = to_numeric_clean(df[price_col])
 
