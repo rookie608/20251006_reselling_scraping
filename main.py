@@ -537,6 +537,24 @@ def _read_all_previous_urls(exclude_path: Path) -> Set[str]:
     print(f"[INFO] 履歴ファイル {len(files)} 件を集計。既出URL 合計 {len(all_urls)} 件")
     return all_urls
 
+# ======== Google Sheet URL パーサ（追加） ========
+_SHEET_KEY_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9-_]+)")
+_GID_RE = re.compile(r"[#&?]gid=(\d+)")
+
+def parse_google_sheet_url(url: str) -> Dict[str, str]:
+    url = (url or "").strip()
+    if not url:
+        return {"key": "", "gid": ""}
+
+    m = _SHEET_KEY_RE.search(url)
+    key = m.group(1) if m else ""
+
+    mg = _GID_RE.search(url)
+    gid = mg.group(1) if mg else ""
+
+    return {"key": key, "gid": gid}
+
+
 # ======== （追加）検索キーワード生成ロジック ========
 KW_MODEL = "gpt-4.1-mini"
 KW_MAX_RETRIES = 5
@@ -718,28 +736,54 @@ def resolve_column_name(df: pd.DataFrame, target: str) -> Optional[str]:
                 return c
     return None
 
-def merge_result_csvs(output_dir: Path) -> pd.DataFrame:
-    files = sorted(output_dir.glob("result_with_まとめ_*.csv"))
-    if not files:
-        raise FileNotFoundError("output/ に result_with_まとめ_*.csv が見つかりません。")
-    dfs = []
-    for fp in files:
-        try:
-            df = pd.read_csv(fp)
-        except UnicodeDecodeError:
-            df = pd.read_csv(fp, encoding="utf-8-sig")
-        dfs.append(df)
-    merged = pd.concat(dfs, ignore_index=True)
+def read_current_run_csv(csv_path: Path) -> pd.DataFrame:
+    """
+    この実行で生成した result_with_まとめ_YYYYMMDDHHMM.csv のみを読み込む。
+    過去ファイルは一切連結しない。
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"この実行のCSVが見つかりません: {csv_path}")
 
-    url_col = resolve_column_name(merged, "url")
+    try:
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    except UnicodeDecodeError:
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    # url列の正規化
+    url_col = resolve_column_name(df, "url")
     if url_col is None:
-        raise KeyError("CSVに 'url' 列が見つかりません。")
+        raise KeyError(f"{csv_path.name} に 'url' 列が見つかりません。")
     if url_col != "url":
-        merged = merged.rename(columns={url_col: "url"})
-    merged = merged.dropna(subset=["url"]).copy()
-    merged["url"] = merged["url"].astype(str).str.strip()
-    merged = merged.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
-    return merged
+        df = df.rename(columns={url_col: "url"})
+
+    df["url"] = df["url"].astype(str).str.strip()
+    df = df.dropna(subset=["url"]).copy()
+    df = df[df["url"] != ""].reset_index(drop=True)
+    df = df.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
+    return df
+
+# def merge_result_csvs(output_dir: Path) -> pd.DataFrame:
+#     files = sorted(output_dir.glob("result_with_まとめ_*.csv"))
+#     if not files:
+#         raise FileNotFoundError("output/ に result_with_まとめ_*.csv が見つかりません。")
+#     dfs = []
+#     for fp in files:
+#         try:
+#             df = pd.read_csv(fp)
+#         except UnicodeDecodeError:
+#             df = pd.read_csv(fp, encoding="utf-8-sig")
+#         dfs.append(df)
+#     merged = pd.concat(dfs, ignore_index=True)
+#
+#     url_col = resolve_column_name(merged, "url")
+#     if url_col is None:
+#         raise KeyError("CSVに 'url' 列が見つかりません。")
+#     if url_col != "url":
+#         merged = merged.rename(columns={url_col: "url"})
+#     merged = merged.dropna(subset=["url"]).copy()
+#     merged["url"] = merged["url"].astype(str).str.strip()
+#     merged = merged.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
+#     return merged
 
 def read_sheet_as_df(ws: "gspread.Worksheet") -> pd.DataFrame:
     values = ws.get_all_values()
@@ -780,33 +824,44 @@ def get_next_ids(last_id: str, count: int) -> List[str]:
     return [f"{prefix}{str(start_num + i + 1).zfill(width)}" for i in range(count)]
 
 def push_to_google_sheet(
-    spreadsheet_key: str,
-    sheet_name: str,
-    service_account_json: Path,
-    header_rows: int = 2
+        spreadsheet_key: str,
+        sheet_name: str,
+        service_account_json: Path,
+        header_rows: int = 2,
+        source_csv_path: Optional[Path] = None,  # ★追加：今回分CSV
 ) -> None:
     """
-    output/result_with_まとめ_*.csv を連結→重複URL排除し、指定シートに存在しないURLのみ B〜O で追記。
+    ★変更後：
+    - 過去分を連結しない
+    - source_csv_path（この実行の result_with_まとめ_YYYYMMDDHHMM.csv）のみを対象に貼り付け
+    - シート既存URLと突合して、新規URLだけ追記
     """
-    root = BASE_DIR
-    output_dir = OUT_DIR
+    if source_csv_path is None:
+        raise ValueError("source_csv_path を指定してください（この実行の result_with_まとめ_*.csv）")
 
-    # 1) CSV マージ
-    df1 = merge_result_csvs(output_dir)
-    (root / "result_merge.csv").write_text(df1.to_csv(index=False), encoding="utf-8")
-    print(f"[INFO] CSVマージ完了: result_merge.csv（{len(df1)} 行）")
+    # 1) 今回分CSVのみ読み込む
+    df1 = read_current_run_csv(source_csv_path)
+    print(f"[INFO] 今回分CSVのみ使用: {source_csv_path.name}（{len(df1)} 行）")
 
     # 2) シート接続
     creds = _gs_get_credentials(service_account_json)
     gc = gspread.authorize(creds)
-    ws = gc.open_by_key(spreadsheet_key).worksheet(sheet_name)
+    sh = gc.open_by_key(spreadsheet_key)
+    if str(sheet_name).isdigit():
+        ws = sh.get_worksheet_by_id(int(sheet_name))
+    else:
+        ws = sh.worksheet(sheet_name)
+
     df2 = read_sheet_as_df(ws)
 
-    # 3) 新規URL抽出
-    df2_urls = df2["url"].astype(str).str.strip().tolist() if "url" in df2.columns else []
+    # 3) 新規URL抽出（シート側のURL列名ゆれ対応）
+    sheet_url_col = resolve_column_name(df2, "url")
+    df2_urls = df2[sheet_url_col].astype(str).str.strip().tolist() if sheet_url_col else []
+
     mask_new = ~df1["url"].astype(str).str.strip().isin(df2_urls)
     df_new = df1.loc[mask_new].reset_index(drop=True)
-    print(f"[INFO] 新規URL 行数: {len(df_new)}")
+
+    print(f"[INFO] 今回分のうち新規URL 行数: {len(df_new)}")
     if df_new.empty:
         print("[INFO] 追加なし。スプレッドシート更新はスキップします。")
         return
@@ -814,7 +869,7 @@ def push_to_google_sheet(
     # 4) 数値列整形
     df_new = coerce_numeric_columns(df_new, ["price", "shipping_fee"])
 
-    # 5) B列の管理番号を生成（下端の最後の非空セルを拾う）
+    # 5) B列の管理番号を生成
     b_values = ws.col_values(col_to_index("B"))
     last_id = next((v for v in reversed(b_values) if v.strip()), "LC0000")
     new_ids = get_next_ids(last_id, len(df_new))
@@ -829,14 +884,78 @@ def push_to_google_sheet(
 
     # 7) 書き込み範囲算出（C列で最初の空行を起点）
     start_row = find_first_empty_row_in_col(ws, "C", header_rows=header_rows)
-    end_row   = start_row + len(write_df) - 1
+    end_row = start_row + len(write_df) - 1
     range_name = f"{WRITE_START_COL}{start_row}:{WRITE_END_COL}{end_row}"
 
-    # 8) 貼り付け（USER_ENTERED）
+    # 8) 貼り付け
     values_2d = write_df.fillna("").astype(str).values.tolist()
     ws.update(range_name, values_2d, value_input_option="USER_ENTERED")
 
     print(f"[INFO] 貼り付け完了: {len(values_2d)} 行（範囲: {range_name}）")
+
+    # def push_to_google_sheet(
+#     spreadsheet_key: str,
+#     sheet_name: str,
+#     service_account_json: Path,
+#     header_rows: int = 2
+# ) -> None:
+#     """
+#     output/result_with_まとめ_*.csv を連結→重複URL排除し、指定シートに存在しないURLのみ B〜O で追記。
+#     """
+#     root = BASE_DIR
+#     output_dir = OUT_DIR
+#
+#     # 1) CSV マージ
+#     df1 = merge_result_csvs(output_dir)
+#     (root / "result_merge.csv").write_text(df1.to_csv(index=False), encoding="utf-8")
+#     print(f"[INFO] CSVマージ完了: result_merge.csv（{len(df1)} 行）")
+#
+#     # 2) シート接続
+#     creds = _gs_get_credentials(service_account_json)
+#     gc = gspread.authorize(creds)
+#     sh = gc.open_by_key(spreadsheet_key)
+#     if str(sheet_name).isdigit():
+#         ws = sh.get_worksheet_by_id(int(sheet_name))
+#     else:
+#         ws = sh.worksheet(sheet_name)
+#
+#     df2 = read_sheet_as_df(ws)
+#
+#     # 3) 新規URL抽出
+#     df2_urls = df2["url"].astype(str).str.strip().tolist() if "url" in df2.columns else []
+#     mask_new = ~df1["url"].astype(str).str.strip().isin(df2_urls)
+#     df_new = df1.loc[mask_new].reset_index(drop=True)
+#     print(f"[INFO] 新規URL 行数: {len(df_new)}")
+#     if df_new.empty:
+#         print("[INFO] 追加なし。スプレッドシート更新はスキップします。")
+#         return
+#
+#     # 4) 数値列整形
+#     df_new = coerce_numeric_columns(df_new, ["price", "shipping_fee"])
+#
+#     # 5) B列の管理番号を生成（下端の最後の非空セルを拾う）
+#     b_values = ws.col_values(col_to_index("B"))
+#     last_id = next((v for v in reversed(b_values) if v.strip()), "LC0000")
+#     new_ids = get_next_ids(last_id, len(df_new))
+#     print(f"[INFO] 管理番号: {last_id} → {new_ids[0]}〜")
+#
+#     # 6) 書き込みデータ組成（B〜O固定）
+#     write_df = pd.DataFrame()
+#     write_df["管理番号"] = new_ids
+#     for h in TARGET_HEADERS[1:]:
+#         src_col = resolve_column_name(df_new, h)
+#         write_df[h] = df_new[src_col] if src_col else ""
+#
+#     # 7) 書き込み範囲算出（C列で最初の空行を起点）
+#     start_row = find_first_empty_row_in_col(ws, "C", header_rows=header_rows)
+#     end_row   = start_row + len(write_df) - 1
+#     range_name = f"{WRITE_START_COL}{start_row}:{WRITE_END_COL}{end_row}"
+#
+#     # 8) 貼り付け（USER_ENTERED）
+#     values_2d = write_df.fillna("").astype(str).values.tolist()
+#     ws.update(range_name, values_2d, value_input_option="USER_ENTERED")
+#
+#     print(f"[INFO] 貼り付け完了: {len(values_2d)} 行（範囲: {range_name}）")
 
 # ========== ここからメイン処理 ==========
 def main():
@@ -877,14 +996,27 @@ def main():
     print(f"[INFO] {len(csv_files)}件のCSVを処理します。")
     write_search_results_header()
 
-    search_urls: List[Dict[str, Any]] = []  # {src_file, src_row, url}
+    search_urls: List[Dict[str, Any]] = []  # {src_file, src_row, url, output_url, output_sheet}
     for csv_file in csv_files:
         df = pd.read_csv(csv_file, dtype=str, keep_default_na=False, encoding="utf-8", engine="python")
+
+        has_output_url = ("output_URL" in df.columns)
+        has_output_sheet = ("シート名" in df.columns)
+
         for idx, row in df.iterrows():
             urls = find_urls_in_row(row.values)
+            out_url = (row.get("output_URL", "") if has_output_url else "").strip()
+            out_sheet = (row.get("シート名", "") if has_output_sheet else "").strip()
+
             for u in urls:
                 if SEARCH_PAGE_HINT in u:
-                    search_urls.append({"src_file": csv_file.name, "src_row": idx+1, "url": u})
+                    search_urls.append({
+                        "src_file": csv_file.name,
+                        "src_row": idx + 1,
+                        "url": u,
+                        "output_url": out_url,
+                        "output_sheet": out_sheet,
+                    })
 
     if not search_urls:
         print("[ERROR] 検索ページURLが見つかりませんでした（www.2ndstreet.jp/search が0件）。"); sys.exit(1)
@@ -1093,15 +1225,59 @@ def main():
     if args.push_to_sheet:
         try:
             service_json = Path(args.service_account).expanduser().resolve()
+
+            # 今回の search_urls から最初に見つかった output_url / output_sheet を採用（なければデフォルト）
+            output_url = ""
+            output_sheet = ""
+
+            for it in search_urls:
+                ou = (it.get("output_url") or "").strip()
+                osn = (it.get("output_sheet") or "").strip()
+                if ou and not output_url:
+                    output_url = ou
+                if osn and not output_sheet:
+                    output_sheet = osn
+                if output_url and output_sheet:
+                    break
+
+            if output_url:
+                parsed = parse_google_sheet_url(output_url)
+                sheet_key = parsed["key"] or args.sheet_key
+
+                # 優先順位：CSVの「シート名」→ URL内gid → 引数の--sheet-name
+                if output_sheet:
+                    sheet_name = output_sheet
+                elif parsed.get("gid"):
+                    sheet_name = parsed["gid"]  # 数字なら get_worksheet_by_id() に流れる
+                else:
+                    sheet_name = args.sheet_name
+
+                print(f"[INFO] CSV指定の出力先を使用: {output_url} / sheet={sheet_name}")
+            else:
+                sheet_key = args.sheet_key
+                sheet_name = args.sheet_name
+                print("[INFO] デフォルト出力先を使用（引数）")
+
+            print(f"[INFO] 出力先: sheet_key={sheet_key} / sheet_name={sheet_name}")
+
             push_to_google_sheet(
-                spreadsheet_key=args.sheet_key,
-                sheet_name=args.sheet_name,
+                spreadsheet_key=sheet_key,
+                sheet_name=sheet_name,
                 service_account_json=service_json,
-                header_rows=args.header_rows
+                header_rows=args.header_rows,
+                source_csv_path=OUT_CSV_KW,  # ★この実行の result_with_まとめ_YYYYMMDDHHMM.csv のみ
             )
+            # push_to_google_sheet(
+            #     spreadsheet_key=sheet_key,
+            #     sheet_name=sheet_name,
+            #     service_account_json=service_json,
+            #     header_rows=args.header_rows
+            # )
+
         except Exception as e:
             print(f"[ERROR] スプレッドシート連携に失敗しました: {e}")
             sys.exit(3)
+
 
 if __name__ == "__main__":
     main()
