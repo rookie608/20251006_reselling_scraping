@@ -281,6 +281,7 @@ def _to_int_or_empty(s: str) -> str:
         return ""
     return str(int(m.group(1).replace(",", "")))
 
+
 # ========== Brand helper ==========
 KNOWN_BRANDS = [
     "Ray-Ban","RAYBAN","RAY-BAN","GUCCI","COACH","PRADA","FENDI","CELINE","CHANEL",
@@ -762,29 +763,6 @@ def read_current_run_csv(csv_path: Path) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
     return df
 
-# def merge_result_csvs(output_dir: Path) -> pd.DataFrame:
-#     files = sorted(output_dir.glob("result_with_まとめ_*.csv"))
-#     if not files:
-#         raise FileNotFoundError("output/ に result_with_まとめ_*.csv が見つかりません。")
-#     dfs = []
-#     for fp in files:
-#         try:
-#             df = pd.read_csv(fp)
-#         except UnicodeDecodeError:
-#             df = pd.read_csv(fp, encoding="utf-8-sig")
-#         dfs.append(df)
-#     merged = pd.concat(dfs, ignore_index=True)
-#
-#     url_col = resolve_column_name(merged, "url")
-#     if url_col is None:
-#         raise KeyError("CSVに 'url' 列が見つかりません。")
-#     if url_col != "url":
-#         merged = merged.rename(columns={url_col: "url"})
-#     merged = merged.dropna(subset=["url"]).copy()
-#     merged["url"] = merged["url"].astype(str).str.strip()
-#     merged = merged.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
-#     return merged
-
 def read_sheet_as_df(ws: "gspread.Worksheet") -> pd.DataFrame:
     values = ws.get_all_values()
     if not values:
@@ -893,69 +871,6 @@ def push_to_google_sheet(
 
     print(f"[INFO] 貼り付け完了: {len(values_2d)} 行（範囲: {range_name}）")
 
-    # def push_to_google_sheet(
-#     spreadsheet_key: str,
-#     sheet_name: str,
-#     service_account_json: Path,
-#     header_rows: int = 2
-# ) -> None:
-#     """
-#     output/result_with_まとめ_*.csv を連結→重複URL排除し、指定シートに存在しないURLのみ B〜O で追記。
-#     """
-#     root = BASE_DIR
-#     output_dir = OUT_DIR
-#
-#     # 1) CSV マージ
-#     df1 = merge_result_csvs(output_dir)
-#     (root / "result_merge.csv").write_text(df1.to_csv(index=False), encoding="utf-8")
-#     print(f"[INFO] CSVマージ完了: result_merge.csv（{len(df1)} 行）")
-#
-#     # 2) シート接続
-#     creds = _gs_get_credentials(service_account_json)
-#     gc = gspread.authorize(creds)
-#     sh = gc.open_by_key(spreadsheet_key)
-#     if str(sheet_name).isdigit():
-#         ws = sh.get_worksheet_by_id(int(sheet_name))
-#     else:
-#         ws = sh.worksheet(sheet_name)
-#
-#     df2 = read_sheet_as_df(ws)
-#
-#     # 3) 新規URL抽出
-#     df2_urls = df2["url"].astype(str).str.strip().tolist() if "url" in df2.columns else []
-#     mask_new = ~df1["url"].astype(str).str.strip().isin(df2_urls)
-#     df_new = df1.loc[mask_new].reset_index(drop=True)
-#     print(f"[INFO] 新規URL 行数: {len(df_new)}")
-#     if df_new.empty:
-#         print("[INFO] 追加なし。スプレッドシート更新はスキップします。")
-#         return
-#
-#     # 4) 数値列整形
-#     df_new = coerce_numeric_columns(df_new, ["price", "shipping_fee"])
-#
-#     # 5) B列の管理番号を生成（下端の最後の非空セルを拾う）
-#     b_values = ws.col_values(col_to_index("B"))
-#     last_id = next((v for v in reversed(b_values) if v.strip()), "LC0000")
-#     new_ids = get_next_ids(last_id, len(df_new))
-#     print(f"[INFO] 管理番号: {last_id} → {new_ids[0]}〜")
-#
-#     # 6) 書き込みデータ組成（B〜O固定）
-#     write_df = pd.DataFrame()
-#     write_df["管理番号"] = new_ids
-#     for h in TARGET_HEADERS[1:]:
-#         src_col = resolve_column_name(df_new, h)
-#         write_df[h] = df_new[src_col] if src_col else ""
-#
-#     # 7) 書き込み範囲算出（C列で最初の空行を起点）
-#     start_row = find_first_empty_row_in_col(ws, "C", header_rows=header_rows)
-#     end_row   = start_row + len(write_df) - 1
-#     range_name = f"{WRITE_START_COL}{start_row}:{WRITE_END_COL}{end_row}"
-#
-#     # 8) 貼り付け（USER_ENTERED）
-#     values_2d = write_df.fillna("").astype(str).values.tolist()
-#     ws.update(range_name, values_2d, value_input_option="USER_ENTERED")
-#
-#     print(f"[INFO] 貼り付け完了: {len(values_2d)} 行（範囲: {range_name}）")
 
 # ========== ここからメイン処理 ==========
 def main():
@@ -1267,12 +1182,6 @@ def main():
                 header_rows=args.header_rows,
                 source_csv_path=OUT_CSV_KW,  # ★この実行の result_with_まとめ_YYYYMMDDHHMM.csv のみ
             )
-            # push_to_google_sheet(
-            #     spreadsheet_key=sheet_key,
-            #     sheet_name=sheet_name,
-            #     service_account_json=service_json,
-            #     header_rows=args.header_rows
-            # )
 
         except Exception as e:
             print(f"[ERROR] スプレッドシート連携に失敗しました: {e}")
