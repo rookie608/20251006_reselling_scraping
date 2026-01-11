@@ -716,14 +716,29 @@ def _gs_get_credentials(service_account_json: Path) -> "Credentials":
         raise FileNotFoundError(f"service_account.json が見つかりません: {service_account_json}")
     return Credentials.from_service_account_file(str(service_account_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
-def find_first_empty_row_in_col(ws: "gspread.Worksheet", col_letter: str, header_rows: int = 2) -> int:
+# def find_first_empty_row_in_col(ws: "gspread.Worksheet", col_letter: str, header_rows: int = 2) -> int:
+#     col_idx = col_to_index(col_letter)
+#     values = ws.col_values(col_idx)
+#     start_row = header_rows + 1
+#     for i in range(start_row, len(values) + 1):
+#         if values[i - 1] == "":
+#             return i
+#     return max(len(values) + 1, start_row)
+def find_append_row(ws: "gspread.Worksheet", col_letter: str = "B", header_rows: int = 2) -> int:
+    """
+    指定列（既定B列）の最終非空行の次の行を返す（=末尾追記）。
+    途中に空行があっても無視するので「歯抜け」を拾わない。
+    """
     col_idx = col_to_index(col_letter)
     values = ws.col_values(col_idx)
+
     start_row = header_rows + 1
-    for i in range(start_row, len(values) + 1):
-        if values[i - 1] == "":
-            return i
-    return max(len(values) + 1, start_row)
+    # 末尾から探す
+    for i in range(len(values), start_row - 1, -1):
+        if str(values[i - 1]).strip() != "":
+            return i + 1
+
+    return start_row
 
 def resolve_column_name(df: pd.DataFrame, target: str) -> Optional[str]:
     if target in df.columns:
@@ -806,22 +821,71 @@ def push_to_google_sheet(
         sheet_name: str,
         service_account_json: Path,
         header_rows: int = 2,
-        source_csv_path: Optional[Path] = None,  # ★追加：今回分CSV
+        source_csv_path: Optional[Path] = None,
 ) -> None:
     """
-    ★変更後：
-    - 過去分を連結しない
-    - source_csv_path（この実行の result_with_まとめ_YYYYMMDDHHMM.csv）のみを対象に貼り付け
-    - シート既存URLと突合して、新規URLだけ追記
+    変更後仕様（要望どおり）：
+    - 過去分の連結なし
+    - シート側URLとの突合（新規だけ）をしない
+    - 今回CSVを「price条件 8000〜50000」→「search_keyword除外」した df を、そのまま末尾追記
     """
     if source_csv_path is None:
         raise ValueError("source_csv_path を指定してください（この実行の result_with_まとめ_*.csv）")
 
     # 1) 今回分CSVのみ読み込む
-    df1 = read_current_run_csv(source_csv_path)
-    print(f"[INFO] 今回分CSVのみ使用: {source_csv_path.name}（{len(df1)} 行）")
+    df = read_current_run_csv(source_csv_path)
+    print(f"[INFO] 今回分CSVのみ使用: {source_csv_path.name}（{len(df)} 行）")
 
-    # 2) シート接続
+    # 2) price条件（8000〜50000）
+    PRICE_MIN = 8000
+    PRICE_MAX = 50000
+
+    if "price" not in df.columns:
+        df["price"] = ""
+
+    # "6,490" / "6490" / "" を想定
+    price_num = pd.to_numeric(
+        df["price"].astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("¥", "", regex=False)
+        .str.replace("円", "", regex=False),
+        errors="coerce"
+    )
+    before_price = len(df)
+    df = df[price_num.between(PRICE_MIN, PRICE_MAX)].copy()
+    print(f"[INFO] price条件 {PRICE_MIN}〜{PRICE_MAX}: {before_price} → {len(df)}")
+
+    # 3) search_keyword除外
+    EXCLUDE_SEARCH_KEYWORDS = {
+        "Ray-Ban RB3386",
+        "Ray-Ban RB3016",
+        "Ray-Ban RB4260D",
+        "GUCCI GG0637SK",
+        "Ray-Ban RB2132",
+        "Ray-Ban RB2180-F",
+        "Ray-Ban RB4181F",
+        "Ray-Ban RB4105",
+        "BLACK FLYS",
+        "Ray-Ban RB2140-A",
+        "Ray-Ban RB4171-F",
+        "Ray-Ban RB3362",
+    }
+
+    if "search_keyword" not in df.columns:
+        df["search_keyword"] = ""
+
+    before_kw = len(df)
+    df = df[~df["search_keyword"].astype(str).str.strip().isin(EXCLUDE_SEARCH_KEYWORDS)].copy()
+    print(f"[INFO] search_keyword除外: {before_kw} → {len(df)}")
+
+    if df.empty:
+        print("[INFO] 条件一致が0件のため、スプレッドシート更新はスキップします。")
+        return
+
+    # 念のため index を詰める（歯抜け対策）
+    df = df.reset_index(drop=True)
+
+    # 4) シート接続
     creds = _gs_get_credentials(service_account_json)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(spreadsheet_key)
@@ -830,46 +894,141 @@ def push_to_google_sheet(
     else:
         ws = sh.worksheet(sheet_name)
 
-    df2 = read_sheet_as_df(ws)
-
-    # 3) 新規URL抽出（シート側のURL列名ゆれ対応）
-    sheet_url_col = resolve_column_name(df2, "url")
-    df2_urls = df2[sheet_url_col].astype(str).str.strip().tolist() if sheet_url_col else []
-
-    mask_new = ~df1["url"].astype(str).str.strip().isin(df2_urls)
-    df_new = df1.loc[mask_new].reset_index(drop=True)
-
-    print(f"[INFO] 今回分のうち新規URL 行数: {len(df_new)}")
-    if df_new.empty:
-        print("[INFO] 追加なし。スプレッドシート更新はスキップします。")
-        return
-
-    # 4) 数値列整形
-    df_new = coerce_numeric_columns(df_new, ["price", "shipping_fee"])
-
-    # 5) B列の管理番号を生成
+    # 5) B列の管理番号を生成（B列の最終値→連番）
     b_values = ws.col_values(col_to_index("B"))
-    last_id = next((v for v in reversed(b_values) if v.strip()), "LC0000")
-    new_ids = get_next_ids(last_id, len(df_new))
+    last_id = next((v for v in reversed(b_values) if str(v).strip()), "LC0000")
+    new_ids = get_next_ids(last_id, len(df))
     print(f"[INFO] 管理番号: {last_id} → {new_ids[0]}〜")
 
     # 6) 書き込みデータ組成（B〜O固定）
     write_df = pd.DataFrame()
     write_df["管理番号"] = new_ids
-    for h in TARGET_HEADERS[1:]:
-        src_col = resolve_column_name(df_new, h)
-        write_df[h] = df_new[src_col] if src_col else ""
 
-    # 7) 書き込み範囲算出（C列で最初の空行を起点）
-    start_row = find_first_empty_row_in_col(ws, "C", header_rows=header_rows)
+    for h in TARGET_HEADERS[1:]:
+        src_col = resolve_column_name(df, h)
+        write_df[h] = df[src_col] if src_col else ""
+
+    # 7) 末尾追記行を決定（B列基準）
+    start_row = find_append_row(ws, col_letter="B", header_rows=header_rows)
     end_row = start_row + len(write_df) - 1
     range_name = f"{WRITE_START_COL}{start_row}:{WRITE_END_COL}{end_row}"
 
-    # 8) 貼り付け
+    # 8) 貼り付け（warning回避：named引数で）
     values_2d = write_df.fillna("").astype(str).values.tolist()
-    ws.update(range_name, values_2d, value_input_option="USER_ENTERED")
+    ws.update(range_name=range_name, values=values_2d, value_input_option="USER_ENTERED")
 
     print(f"[INFO] 貼り付け完了: {len(values_2d)} 行（範囲: {range_name}）")
+
+
+# def push_to_google_sheet(
+#         spreadsheet_key: str,
+#         sheet_name: str,
+#         service_account_json: Path,
+#         header_rows: int = 2,
+#         source_csv_path: Optional[Path] = None,  # ★追加：今回分CSV
+# ) -> None:
+#     """
+#     ★変更後：
+#     - 過去分を連結しない
+#     - source_csv_path（この実行の result_with_まとめ_YYYYMMDDHHMM.csv）のみを対象に貼り付け
+#     - シート既存URLと突合して、新規URLだけ追記
+#     """
+#     if source_csv_path is None:
+#         raise ValueError("source_csv_path を指定してください（この実行の result_with_まとめ_*.csv）")
+#
+#     # 1) 今回分CSVのみ読み込む
+#     df1 = read_current_run_csv(source_csv_path)
+#     print(f"[INFO] 今回分CSVのみ使用: {source_csv_path.name}（{len(df1)} 行）")
+#
+#     # 2) シート接続
+#     creds = _gs_get_credentials(service_account_json)
+#     gc = gspread.authorize(creds)
+#     sh = gc.open_by_key(spreadsheet_key)
+#     if str(sheet_name).isdigit():
+#         ws = sh.get_worksheet_by_id(int(sheet_name))
+#     else:
+#         ws = sh.worksheet(sheet_name)
+#
+#     df2 = read_sheet_as_df(ws)
+#
+#     # 3) 新規URL抽出（シート側のURL列名ゆれ対応）
+#     sheet_url_col = resolve_column_name(df2, "url")
+#     df2_urls = df2[sheet_url_col].astype(str).str.strip().tolist() if sheet_url_col else []
+#
+#     mask_new = ~df1["url"].astype(str).str.strip().isin(df2_urls)
+#     df_new = df1.loc[mask_new].reset_index(drop=True)
+#
+#     print(f"[INFO] 今回分のうち新規URL 行数: {len(df_new)}")
+#     if df_new.empty:
+#         print("[INFO] 追加なし。スプレッドシート更新はスキップします。")
+#         return
+#
+#     # 4) 数値列整形
+#     PRICE_MIN = 8000
+#     PRICE_MAX = 50000
+#
+#     df_new = df_new.copy()
+#     if "price" not in df_new.columns:
+#         df_new["price"] = ""
+#
+#     df_new["price_num"] = pd.to_numeric(df_new["price"], errors="coerce")
+#
+#     before_price = len(df_new)
+#     df_new = df_new[df_new["price_num"].between(PRICE_MIN, PRICE_MAX)].copy()
+#     df_new = df_new.drop(columns=["price_num"])
+#     print(f"[INFO] price条件 {PRICE_MIN}〜{PRICE_MAX}: {before_price} → {len(df_new)}")
+#
+#     # search_keyword: 指定リストを除外
+#     EXCLUDE_SEARCH_KEYWORDS = {
+#         "Ray-Ban RB3386",
+#         "Ray-Ban RB3016",
+#         "Ray-Ban RB4260D",
+#         "GUCCI GG0637SK",
+#         "Ray-Ban RB2132",
+#         "Ray-Ban RB2180-F",
+#         "Ray-Ban RB4181F",
+#         "Ray-Ban RB4105",
+#         "BLACK FLYS",
+#         "Ray-Ban RB2140-A",
+#         "Ray-Ban RB4171-F",
+#         "Ray-Ban RB3362",
+#     }
+#
+#     if "search_keyword" not in df_new.columns:
+#         df_new["search_keyword"] = ""
+#
+#     before_kw = len(df_new)
+#     df_new = df_new[~df_new["search_keyword"].astype(str).str.strip().isin(EXCLUDE_SEARCH_KEYWORDS)].copy()
+#     print(f"[INFO] search_keyword除外: {before_kw} → {len(df_new)}")
+#
+#     # フィルタ後に0件なら終了
+#     if df_new.empty:
+#         print("[INFO] 追加条件で0件になりました。スプレッドシート更新はスキップします。")
+#         return
+#
+#     # 5) B列の管理番号を生成
+#     b_values = ws.col_values(col_to_index("B"))
+#     last_id = next((v for v in reversed(b_values) if v.strip()), "LC0000")
+#     new_ids = get_next_ids(last_id, len(df_new))
+#     print(f"[INFO] 管理番号: {last_id} → {new_ids[0]}〜")
+#
+#     # 6) 書き込みデータ組成（B〜O固定）
+#     write_df = pd.DataFrame()
+#     write_df["管理番号"] = new_ids
+#     for h in TARGET_HEADERS[1:]:
+#         src_col = resolve_column_name(df_new, h)
+#         write_df[h] = df_new[src_col] if src_col else ""
+#
+#     # 7) 書き込み範囲算出（C列で最初の空行を起点）
+#     start_row = find_first_empty_row_in_col(ws, "C", header_rows=header_rows)
+#     end_row = start_row + len(write_df) - 1
+#     range_name = f"{WRITE_START_COL}{start_row}:{WRITE_END_COL}{end_row}"
+#
+#     # 8) 貼り付け
+#     values_2d = write_df.fillna("").astype(str).values.tolist()
+#     ws.update(range_name, values_2d, value_input_option="USER_ENTERED")
+#
+#     print(f"[INFO] 貼り付け完了: {len(values_2d)} 行（範囲: {range_name}）")
 
 
 # ========== ここからメイン処理 ==========

@@ -139,7 +139,7 @@ def main():
     if "search_keyword" not in df.columns:
         print("[WARN] 'search_keyword' column not found. Extraction skipped.")
     else:
-        MIN_DUP_COUNT = 5
+        MIN_DUP_COUNT = 4
         MEDIAN_THRESHOLD = -30
 
         # 正規化
